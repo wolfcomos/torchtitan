@@ -58,7 +58,6 @@ import spmd_types as spmd
 import torch
 import triton
 import triton.language as tl
-
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import local_map
 
@@ -440,7 +439,8 @@ class FusedSwiGLU(FeedForward):
 
     @dataclass(kw_only=True, slots=True)
     class Config(FeedForward.Config):
-        pass
+        mxfp8_fused: bool = False
+        fuse_activation: bool = False
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -449,10 +449,25 @@ class FusedSwiGLU(FeedForward):
         self.w13 = torch.nn.Parameter(
             torch.empty(config.w1.out_features, 2, config.w1.in_features)
         )
+        self.mxfp8_fused = config.mxfp8_fused
+        self.fuse_activation = config.fuse_activation
         self.register_state_dict_post_hook(self._split_w13_on_save)
         self.register_load_state_dict_pre_hook(self._merge_w13_on_load)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mxfp8_fused and not isinstance(x, DTensor):
+            from torchao.prototype.moe_training import mxfp8_swiglu_mlp_w13
+
+            output = mxfp8_swiglu_mlp_w13(
+                x,
+                self.w13,
+                self.w2.weight,
+                fuse_activation=self.fuse_activation,
+                wgrad_with_hp=self.w2.wgrad_with_hp,
+            )
+            if self.w2.bias is not None:
+                output = output + self.w2.bias.to(output.dtype)
+            return output
         gate, up = torch.einsum("...d,hgd->...hg", x, self.w13).unbind(-1)
         return self.w2(_fused_silu_and_mul(gate, up))
 
@@ -494,7 +509,20 @@ def fused_swiglu(cfg: FeedForward.Config) -> FusedSwiGLU.Config:
     if w1_init is not None and w3_init is not None:
         param_init = {"w13": _make_fused_gate_up_init(w1_init, w3_init, gate_up_axis=1)}
 
-    fused = derive(cfg, FusedSwiGLU.Config, param_init=param_init)
+    w2_owner = getattr(type(cfg.w2), "_owner", None)
+    mxfp8_fused = (
+        w2_owner is not None
+        and w2_owner.__module__
+        == "torchtitan.components.quantization.mx"
+        and w2_owner.__name__ == "MXFP8Linear"
+    )
+    fused = derive(
+        cfg,
+        FusedSwiGLU.Config,
+        param_init=param_init,
+        mxfp8_fused=mxfp8_fused,
+        fuse_activation=getattr(cfg.w2, "fuse_swiglu_mxfp8", False),
+    )
 
     base = cfg.sharding_config
     fused.sharding_config = ShardingConfig(
@@ -523,7 +551,9 @@ class FusedGroupedExperts(GroupedExperts):
 
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
-        pass
+        mxfp8_fused: bool = False
+        fuse_activation: bool = False
+        wgrad_with_hp: bool = False
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -534,6 +564,9 @@ class FusedGroupedExperts(GroupedExperts):
         self.w13 = torch.nn.Parameter(
             torch.empty(config.num_experts, config.hidden_dim, 2, config.dim)
         )
+        self.mxfp8_fused = config.mxfp8_fused
+        self.fuse_activation = config.fuse_activation
+        self.wgrad_with_hp = config.wgrad_with_hp
 
         self.register_state_dict_post_hook(self._split_w13_on_save)
         self.register_load_state_dict_pre_hook(self._merge_w13_on_load)
@@ -553,6 +586,18 @@ class FusedGroupedExperts(GroupedExperts):
 
         E, F, _, D = w13.shape
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+
+        if self.mxfp8_fused:
+            from torchao.prototype.moe_training import mxfp8_swiglu_grouped_mlp_w13
+
+            return mxfp8_swiglu_grouped_mlp_w13(
+                x_RD.bfloat16(),
+                w13.bfloat16(),
+                w2_EDF.bfloat16().transpose(-2, -1),
+                offsets_E,
+                fuse_activation=self.fuse_activation,
+                wgrad_with_hp=self.wgrad_with_hp,
+            ).type_as(x_RD)
 
         w13_E_D_2F = w13.bfloat16().reshape(E, F * 2, D).transpose(-2, -1)
         gate_up_R2F = self._grouped_mm(
@@ -618,13 +663,25 @@ def fused_grouped_experts(
     cfg: GroupedExperts.Config,
 ) -> GroupedExperts.Config:
     # Remap w1_EFD/w3_EFD param-init and state shardings onto the fused w13.
-    # Idempotent: return cfg unchanged if it is not a stock GroupedExperts.Config
-    # (already fused, or a subclass like GptOssGroupedExperts).
-    if type(cfg) is not GroupedExperts.Config:
+    # Idempotent: return cfg unchanged if it is not owned by a GroupedExperts
+    # implementation. The check is on the owning module class rather than the
+    # exact Config type so that a quantization-derived subclass -- e.g.
+    # MXFP8GroupedExperts.Config, which only overrides the _grouped_mm seam --
+    # still fuses, which is what the MXFP8 SwiGLU A/B configs rely on.
+    owner = getattr(type(cfg), "_owner", None)
+    if owner is not None and not issubclass(owner, GroupedExperts):
         return cfg
 
     param_init = _fuse_w13_grouped_experts_param_init(cfg.param_init)
-    fused = derive(cfg, FusedGroupedExperts.Config, param_init=param_init)
+    recipe_name = getattr(cfg, "recipe_name", "")
+    fused = derive(
+        cfg,
+        FusedGroupedExperts.Config,
+        param_init=param_init,
+        mxfp8_fused=recipe_name.startswith("mxfp8_"),
+        fuse_activation=getattr(cfg, "fuse_swiglu_mxfp8", False),
+        wgrad_with_hp=recipe_name.endswith("wgrad_with_hp"),
+    )
     base = cfg.sharding_config
     if base is not None:
         fused.sharding_config = _fuse_w13_grouped_experts_sharding(base)

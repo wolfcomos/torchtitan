@@ -126,6 +126,48 @@ def deepseek_v3_debugmodel_minimal_async_ep() -> Trainer.Config:
     return config
 
 
+def _deepseek_v3_debugmodel_mxfp8_swiglu_ab(
+    *, fuse_swiglu_mxfp8: bool
+) -> Trainer.Config:
+    """Shared harness for the grouped-expert SwiGLU fusion A/B.
+
+    Distinct from ``deepseek_v3_debugmodel_mxfp8``: only the grouped-expert
+    GEMMs are quantized, so the A/B isolates the expert SwiGLU boundary rather
+    than also moving the dense Linear layers to MXFP8.
+    """
+    config = deepseek_v3_debugmodel()
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            MXFP8GroupedExpertsConverter.Config(
+                recipe_name="mxfp8_rceil",
+                pad_multiple=128,
+                model_compile_enabled=True,
+                fuse_swiglu_mxfp8=fuse_swiglu_mxfp8,
+            ),
+        ],
+    )
+    enable_fused_swiglu(config)
+    # The padded token-group dispatch the MXFP8 grouped GEMMs need is only
+    # produced by the EP permute path.
+    config.parallelism = ParallelismConfig(expert_parallel_degree=2)
+    config.debug.moe_force_load_balance = True
+    config.training.steps = 50
+    config.metrics.log_freq = 1
+    return config
+
+
+def deepseek_v3_debugmodel_mxfp8_unfused_swiglu() -> Trainer.Config:
+    """MXFP8 grouped-expert A/B baseline: standalone SwiGLU quantization."""
+    return _deepseek_v3_debugmodel_mxfp8_swiglu_ab(fuse_swiglu_mxfp8=False)
+
+
+def deepseek_v3_debugmodel_mxfp8_fused_swiglu() -> Trainer.Config:
+    """MXFP8 grouped-expert SwiGLU fusion benchmark on SM100."""
+    return _deepseek_v3_debugmodel_mxfp8_swiglu_ab(fuse_swiglu_mxfp8=True)
+
+
 def deepseek_v3_16b() -> Trainer.Config:
     model_spec = model_registry("16B", attn_backend="flex")
     return Trainer.Config(

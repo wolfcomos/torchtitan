@@ -9,14 +9,20 @@ import unittest
 import spmd_types as spmd
 import torch
 
+from torchtitan.config.override import apply_overrides
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.deepseek_v3.config_registry import (
     deepseek_v3_debugmodel_minimal_async_ep,
+    deepseek_v3_debugmodel_mxfp8_fused_swiglu,
+)
+from torchtitan.models.llama3.config_registry import (
+    llama3_debugmodel_mxfp8_fused_swiglu,
 )
 from torchtitan.overrides.fused_swiglu import (
-    fused_grouped_experts,
     FusedGroupedExperts,
+    FusedSwiGLU,
+    fused_grouped_experts,
     silu_and_mul_backward_kernel,
     silu_and_mul_forward_kernel,
     silu_and_mul_op,
@@ -59,6 +65,48 @@ class TestFusedSwiGLUOverride(unittest.TestCase):
         replacement = fused_grouped_experts(cfg)
 
         self.assertIsInstance(replacement, FusedGroupedExperts.Config)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10,
+        "MXFP8 fusion requires SM100",
+    )
+    def test_mxfp8_converter_composes_with_dense_override(self):
+        config = llama3_debugmodel_mxfp8_fused_swiglu()
+        model_config = config.model_spec.model
+        model_config.update_from_config(config=config)
+        apply_overrides(config.override, config)
+        with torch.device("meta"):
+            model = model_config.build()
+        fused = [
+            module
+            for module in model.modules()
+            if isinstance(module, FusedSwiGLU)
+        ]
+        self.assertTrue(fused)
+        self.assertTrue(all(module.mxfp8_fused for module in fused))
+        self.assertTrue(all(module.fuse_activation for module in fused))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10,
+        "MXFP8 fusion requires SM100",
+    )
+    def test_mxfp8_converter_composes_with_grouped_override(self):
+        config = deepseek_v3_debugmodel_mxfp8_fused_swiglu()
+        model_config = config.model_spec.model
+        model_config.update_from_config(config=config)
+        apply_overrides(config.override, config)
+        with torch.device("meta"):
+            model = model_config.build()
+        fused = [
+            module
+            for module in model.modules()
+            if isinstance(module, FusedGroupedExperts)
+        ]
+        self.assertTrue(fused)
+        self.assertTrue(all(module.mxfp8_fused for module in fused))
+        self.assertTrue(all(module.fuse_activation for module in fused))
 
 
 class TestFusedGroupedExperts(unittest.TestCase):

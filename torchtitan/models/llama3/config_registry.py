@@ -31,6 +31,8 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 from .model import Llama3Model
 
+_FUSED_SWIGLU_OVERRIDE = "torchtitan.overrides.fused_swiglu.fused_swiglu"
+
 
 def llama3_debugmodel() -> Trainer.Config:
     model_spec = model_registry("debugmodel")
@@ -133,6 +135,45 @@ def llama3_debugmodel_first_85_pct_layers_nvfp4() -> Trainer.Config:
             ),
         ],
     )
+    return config
+
+
+def _llama3_debugmodel_mxfp8(*, fuse_swiglu_mxfp8: bool) -> Trainer.Config:
+    config = llama3_debugmodel()
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            MXFP8LinearConverter.Config(
+                fqns=["feed_forward"],
+                model_compile_enabled=True,
+                fuse_swiglu_mxfp8=fuse_swiglu_mxfp8,
+            ),
+        ],
+    )
+    # llama3 is dense, so only the FeedForward override is needed; naming the
+    # factory (not the module) is required since override.imports resolves each
+    # @override target individually.
+    config.override.imports.append(_FUSED_SWIGLU_OVERRIDE)
+    config.training.steps = 50
+    config.metrics.log_freq = 1
+    return config
+
+
+def llama3_debugmodel_mxfp8() -> Trainer.Config:
+    """Dense MXFP8 A/B baseline: fused w13, standalone SwiGLU quantization."""
+    return _llama3_debugmodel_mxfp8(fuse_swiglu_mxfp8=False)
+
+
+def llama3_debugmodel_mxfp8_fused_swiglu() -> Trainer.Config:
+    """Dense MXFP8 A/B candidate: fused w13, unified SwiGLU+MXFP8 kernel."""
+    return _llama3_debugmodel_mxfp8(fuse_swiglu_mxfp8=True)
+
+
+def llama3_debugmodel_mxfp8_stock_ffn() -> Trainer.Config:
+    """Dense MXFP8 context run: stock FeedForward, no fused-w13 override."""
+    config = _llama3_debugmodel_mxfp8(fuse_swiglu_mxfp8=False)
+    config.override.imports.remove(_FUSED_SWIGLU_OVERRIDE)
     return config
 
 

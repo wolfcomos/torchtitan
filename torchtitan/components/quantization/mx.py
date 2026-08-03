@@ -33,7 +33,8 @@ try:
         class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds MXFP8Linear."""
 
-            pass
+            wgrad_with_hp: bool = False
+            fuse_swiglu_mxfp8: bool = False
 
         def __init__(self, config: Config):
             TorchAOMXFP8Linear.__init__(
@@ -41,6 +42,7 @@ try:
                 config.in_features,
                 config.out_features,
                 bias=config.bias,
+                wgrad_with_hp=config.wgrad_with_hp,
             )
 
 except ImportError:
@@ -58,6 +60,10 @@ class MXFP8LinearConverter(QuantizationConverter):
         Only Linear.Config entries whose FQN contains a match are converted.
         If empty, all Linear modules are converted.
         """
+        wgrad_with_hp: bool = False
+        """Compute linear weight gradients with BF16 GEMMs."""
+        fuse_swiglu_mxfp8: bool = False
+        """Use fused SwiGLU activation quantization when the override is active."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -86,6 +92,8 @@ class MXFP8LinearConverter(QuantizationConverter):
                     out_features=config.out_features,
                     bias=config.bias,
                     param_init=config.param_init,
+                    wgrad_with_hp=self.config.wgrad_with_hp,
+                    fuse_swiglu_mxfp8=self.config.fuse_swiglu_mxfp8,
                 )
                 if parent is None:
                     model_config = new_config
@@ -120,6 +128,7 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             recipe_name: str = "mxfp8_rceil"
+            fuse_swiglu_mxfp8: bool = False
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -151,18 +160,23 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
 
     @dataclass(kw_only=True, slots=True)
     class Config(QuantizationConverter.Config):
-        recipe_name: Literal["mxfp8_rceil"] = "mxfp8_rceil"
+        recipe_name: Literal[
+            "mxfp8_rceil",
+            "mxfp8_rceil_wgrad_with_hp",
+        ] = "mxfp8_rceil"
         """
         Quantization recipe name for grouped GEMMs. Options: ["mxfp8_rceil"]
 
-        - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL rounding mode
-          when computing the e8m0 scale factors.
+        - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL scales.
+        - mxfp8_rceil_wgrad_with_hp: same fprop/dgrad path with BF16 wgrad.
         """
         pad_multiple: int = 32
         """
         Pad per-expert token groups to this multiple for MXFP8 grouped GEMM alignment.
         The CuTeDSL quantization kernel on sm_100 requires multiples of 128.
         """
+        fuse_swiglu_mxfp8: bool = False
+        """Fuse SwiGLU fprop/dgrad with rowwise MXFP8 casts."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -191,6 +205,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
+                fuse_swiglu_mxfp8=self.config.fuse_swiglu_mxfp8,
             )
             if parent is None:
                 model_config = new_config
