@@ -202,6 +202,81 @@ def deepseek_v3_16b() -> Trainer.Config:
     )
 
 
+def _deepseek_v3_16b_mxfp8_exp(
+    *, fused_swiglu_override: bool, fuse_swiglu_mxfp8: bool
+) -> Trainer.Config:
+    """16B MXFP8 end-to-end harness, mirroring the JET regular-MXFP8 workload.
+
+    Converters match that workload: MXFP8Linear over attention, dense FFN and
+    shared-expert linears, plus MXFP8 routed-expert grouped GEMMs. Three arms
+    are derived from this so the two independent changes can be separated:
+
+      * regular   -- no override; routed experts run separate w1/w3 grouped
+                     mms, then silu(gate)*up, then w2.
+      * w13       -- override on, fuse_swiglu_mxfp8=False; gate+up are one
+                     fused w13 GEMM, activation still cast standalone.
+      * fused     -- override on, fuse_swiglu_mxfp8=True; activation and its
+                     MXFP8 cast collapse into the unified kernel.
+
+    moe_hidden_dim (1408) and the shared-expert width (2816) are 128-divisible
+    so those qualify for the fused kernel; the layer-0 dense FFN is 10944 and
+    falls back to the per-GEMM mx_mm path in every arm.
+
+    Uses the in-repo test tokenizer and c4_test so no downloaded assets are
+    needed; token content affects neither FLOPs nor kernel shapes.
+    """
+    config = deepseek_v3_16b()
+    config.hf_assets_path = "./tests/assets/tokenizer"
+    config.dataloader = HuggingFaceTextDataLoader.Config(dataset="c4_test")
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        converters=[
+            MXFP8LinearConverter.Config(
+                fqns=["attention", "shared_experts", "feed_forward"],
+                model_compile_enabled=True,
+                fuse_swiglu_mxfp8=fuse_swiglu_mxfp8,
+            ),
+            MXFP8GroupedExpertsConverter.Config(
+                recipe_name="mxfp8_rceil",
+                pad_multiple=128,
+                model_compile_enabled=True,
+                fuse_swiglu_mxfp8=fuse_swiglu_mxfp8,
+            ),
+        ],
+    )
+    if fused_swiglu_override:
+        enable_fused_swiglu(config)
+    # EP=8 in the JET recipe; this host has 4 GPUs.
+    config.parallelism = ParallelismConfig(expert_parallel_degree=4)
+    config.debug.moe_force_load_balance = True
+    config.training = TrainingConfig(local_batch_size=4, seq_len=4096, steps=50)
+    config.checkpoint = CheckpointManager.Config(enable=False)
+    return config
+
+
+def deepseek_v3_16b_mxfp8_exp() -> Trainer.Config:
+    """Regular MXFP8 arm: no fused-SwiGLU override (the JET control)."""
+    return _deepseek_v3_16b_mxfp8_exp(
+        fused_swiglu_override=False, fuse_swiglu_mxfp8=False
+    )
+
+
+def deepseek_v3_16b_mxfp8_w13_exp() -> Trainer.Config:
+    """Intermediate arm: fused w13 GEMM only, standalone activation casts."""
+    return _deepseek_v3_16b_mxfp8_exp(
+        fused_swiglu_override=True, fuse_swiglu_mxfp8=False
+    )
+
+
+def deepseek_v3_16b_mxfp8_fused_swiglu_exp() -> Trainer.Config:
+    """Treatment arm: fused w13 plus the unified SwiGLU+MXFP8 kernel."""
+    return _deepseek_v3_16b_mxfp8_exp(
+        fused_swiglu_override=True, fuse_swiglu_mxfp8=True
+    )
+
+
 def deepseek_v3_16b_hybridep() -> Trainer.Config:
     config = deepseek_v3_16b()
     config.model_spec = model_registry(
