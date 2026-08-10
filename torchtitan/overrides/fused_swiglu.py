@@ -456,7 +456,7 @@ class FusedSwiGLU(FeedForward):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.mxfp8_fused and not isinstance(x, DTensor):
-            from torchao.prototype.moe_training import mxfp8_swiglu_mlp_w13
+            from torchtitan.overrides.swiglu_mlp import mxfp8_swiglu_mlp_w13
 
             output = mxfp8_swiglu_mlp_w13(
                 x,
@@ -588,7 +588,7 @@ class FusedGroupedExperts(GroupedExperts):
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
 
         if self.mxfp8_fused:
-            from torchao.prototype.moe_training import mxfp8_swiglu_grouped_mlp_w13
+            from torchtitan.overrides.swiglu_mlp import mxfp8_swiglu_grouped_mlp_w13
 
             return mxfp8_swiglu_grouped_mlp_w13(
                 x_RD.bfloat16(),
