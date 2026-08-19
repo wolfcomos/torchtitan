@@ -42,8 +42,6 @@ from torchao.prototype.moe_training.kernels.mxfp8.quant import (
     _mxfp8_cutedsl_kernels_available,
     mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_2d_32x1_cutedsl,
-    gated_act_mxfp8_backward,
-    gated_act_mxfp8_forward,
 )
 from torchao.prototype.moe_training.mxfp8_grouped_mm import (
     _compute_dgrad_sm100,
@@ -126,7 +124,13 @@ def _empty_mxfp8_outputs(t):
 
 def _swiglu_forward_casts(gated, fuse_activation, colwise):
     if fuse_activation:
-        return gated_act_mxfp8_forward(gated, rowwise=True, colwise=colwise)
+        # Lazy: the kernel module imports the CuTe DSL runtime at module
+        # scope; the unfused fallback must work without it.
+        from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8 import (
+            gated_act_mxfp8_cutedsl_forward,
+        )
+
+        return gated_act_mxfp8_cutedsl_forward(gated, rowwise=True, colwise=colwise)
     h = _swiglu_forward_hp(gated)
     h_rw, hs_rw = mxfp8_quantize_2d_1x32_cutedsl(h, scaling_mode=_SCALE_MODE.value)
     if colwise:
@@ -158,7 +162,13 @@ def _swiglu_backward_hp(grad_h, gated):
 
 def _swiglu_backward_casts(grad_h, gated, fuse_activation, colwise):
     if fuse_activation:
-        return gated_act_mxfp8_backward(grad_h, gated, rowwise=True, colwise=colwise)
+        from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8 import (
+            gated_act_mxfp8_cutedsl_backward,
+        )
+
+        return gated_act_mxfp8_cutedsl_backward(
+            grad_h, gated, rowwise=True, colwise=colwise
+        )
     d = _swiglu_backward_hp(grad_h, gated)
     d_rw, ds_rw = mxfp8_quantize_2d_1x32_cutedsl(d, scaling_mode=_SCALE_MODE.value)
     if colwise:

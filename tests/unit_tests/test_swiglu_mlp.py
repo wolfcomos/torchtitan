@@ -36,8 +36,8 @@ _SHAPES = [
 ]
 
 _SWIGLU_OPS = {
-    "torchao::gated_act_mxfp8_forward",
-    "torchao::gated_act_mxfp8_backward",
+    "torchao::gated_act_mxfp8_cutedsl_forward",
+    "torchao::gated_act_mxfp8_cutedsl_backward",
 }
 _STANDALONE_CAST_OPS = {
     "torchao::mxfp8_quantize_2d_1x32_cutedsl",
@@ -197,15 +197,15 @@ def test_no_standalone_activation_casts_in_fused_mode():
     # Fused mode: one unified kernel per direction, and the only standalone
     # casts are the GEMM-operand casts (fwd: x, w13, w2 rowwise; bwd: go
     # rowwise plus w2, w13, x, go colwise).
-    assert fused.get("torchao::gated_act_mxfp8_forward", 0) == 1
-    assert fused.get("torchao::gated_act_mxfp8_backward", 0) == 1
+    assert fused.get("torchao::gated_act_mxfp8_cutedsl_forward", 0) == 1
+    assert fused.get("torchao::gated_act_mxfp8_cutedsl_backward", 0) == 1
     assert fused.get("torchao::mxfp8_quantize_2d_1x32_cutedsl", 0) == 4
     assert fused.get("torchao::mxfp8_quantize_2d_32x1_cutedsl", 0) == 4
 
     # Unfused mode: no unified kernel; the SwiGLU boundary adds exactly one
     # rowwise + one colwise standalone cast per direction (h and [dGate|dUp]).
-    assert unfused.get("torchao::gated_act_mxfp8_forward", 0) == 0
-    assert unfused.get("torchao::gated_act_mxfp8_backward", 0) == 0
+    assert unfused.get("torchao::gated_act_mxfp8_cutedsl_forward", 0) == 0
+    assert unfused.get("torchao::gated_act_mxfp8_cutedsl_backward", 0) == 0
     assert unfused.get("torchao::mxfp8_quantize_2d_1x32_cutedsl", 0) == 6
     assert unfused.get("torchao::mxfp8_quantize_2d_32x1_cutedsl", 0) == 6
 
@@ -535,15 +535,15 @@ def test_grouped_no_standalone_activation_casts_in_fused_mode():
     # Fused mode: the only 2D cutedsl casts are the GEMM-operand rowwise casts
     # of x (fwd) and grad_out (bwd); wgrad colwise casts use the CUDA dim1
     # kernel, mirroring the existing grouped wgrad path.
-    assert fused.get("torchao::gated_act_mxfp8_forward", 0) == 1
-    assert fused.get("torchao::gated_act_mxfp8_backward", 0) == 1
+    assert fused.get("torchao::gated_act_mxfp8_cutedsl_forward", 0) == 1
+    assert fused.get("torchao::gated_act_mxfp8_cutedsl_backward", 0) == 1
     assert fused.get("torchao::mxfp8_quantize_2d_1x32_cutedsl", 0) == 2
     assert fused.get("torchao::mxfp8_quantize_2d_32x1_cutedsl", 0) == 0
 
     # Unfused mode: the SwiGLU boundary adds one rowwise + one colwise
     # standalone cast per direction (h and [dGate | dUp]).
-    assert unfused.get("torchao::gated_act_mxfp8_forward", 0) == 0
-    assert unfused.get("torchao::gated_act_mxfp8_backward", 0) == 0
+    assert unfused.get("torchao::gated_act_mxfp8_cutedsl_forward", 0) == 0
+    assert unfused.get("torchao::gated_act_mxfp8_cutedsl_backward", 0) == 0
     assert unfused.get("torchao::mxfp8_quantize_2d_1x32_cutedsl", 0) == 4
     assert unfused.get("torchao::mxfp8_quantize_2d_32x1_cutedsl", 0) == 2
 
