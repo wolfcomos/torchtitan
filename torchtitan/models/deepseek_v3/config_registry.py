@@ -108,25 +108,6 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_debugmodel_mxfp8_grouped_mlp() -> Trainer.Config:
-    # Fused arm of deepseek_v3_debugmodel_mxfp8: the override swaps the
-    # converter-produced MXFP8 inner experts for the fused grouped-MLP
-    # composite (torchtitan/overrides/mxfp8_grouped_mlp.py) when its gates
-    # pass; the converter keeps the dense MXFP8Linear swap and the
-    # pad_multiple=128 token dispatcher. disable_cuda_graphs is required by
-    # the TorchAOTokenDispatcher under EP>1; moe_force_load_balance keeps the
-    # per-rank routed row count fixed (round-robin before the all-to-all,
-    # exact at debugmodel shapes) so loss-parity runs against the unfused arm
-    # compare a constant R.
-    config = deepseek_v3_debugmodel_mxfp8()
-    config.override.imports.append(
-        "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
-    )
-    config.training.disable_cuda_graphs = True
-    config.debug.moe_force_load_balance = True
-    return config
-
-
 def _set_routed_experts_pad_multiple(config: Trainer.Config, value: int) -> None:
     """Retarget the (already converter-swapped) TorchAO token dispatchers.
 
@@ -297,15 +278,6 @@ def deepseek_v3_16b_mxfp8() -> Trainer.Config:
                 pad_multiple=128,
             ),
         ],
-    )
-    return config
-
-
-def deepseek_v3_16b_mxfp8_grouped_mlp() -> Trainer.Config:
-    # Fused arm of deepseek_v3_16b_mxfp8; differs ONLY in the override import.
-    config = deepseek_v3_16b_mxfp8()
-    config.override.imports.append(
-        "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
     )
     return config
 
