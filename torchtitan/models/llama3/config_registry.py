@@ -9,7 +9,7 @@ from typing import cast
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
 from torchtitan.components.quantization import (
     Float8LinearConverter,
     MXFP8LinearConverter,
@@ -244,6 +244,9 @@ def llama3_8b_mxfp8() -> Trainer.Config:
     # Swap dense Linear layers for MXFP8Linear. compile is enabled so the
     # converter's compile requirement is satisfied. This is the regular-Trainer
     # (torch.compile) baseline counterpart to graph_trainer_llama3_8b_mxfp8.
+    # The lm_head stays BF16: the converter excludes it unless
+    # quantize_lm_head is set (an empty fqns list previously swapped it
+    # silently, against the tree-wide last-layer-precision convention).
     config.compile = CompileConfig(enable=True, components=["model"])
     config.model_spec = model_registry(
         "8B",

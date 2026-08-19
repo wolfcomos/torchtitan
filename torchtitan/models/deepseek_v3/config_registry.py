@@ -7,7 +7,7 @@
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
 from torchtitan.components.quantization import (
     Float8GroupedExpertsConverter,
     Float8LinearConverter,
@@ -96,6 +96,32 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
             MXFP8LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=["attention", "shared_experts", "feed_forward"],
+            ),
+            MXFP8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
+def deepseek_v3_debugmodel_mxfp8_lm_head() -> Trainer.Config:
+    # deepseek_v3_debugmodel_mxfp8 plus the LM-head output projection in
+    # MXFP8 (the torchtitan analog of Megatron-LM's fp8_output_proj knob).
+    # Opt-in: the final projection is precision-sensitive and stays BF16 by
+    # convention unless quantize_lm_head is set.
+    config = deepseek_v3_debugmodel()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "shared_experts", "feed_forward"],
+                quantize_lm_head=True,
             ),
             MXFP8GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,

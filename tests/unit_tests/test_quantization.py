@@ -353,3 +353,60 @@ def test_quantized_grouped_experts():
     assert issubclass(float8_cls, GptOssGroupedExperts)
     assert hasattr(mxfp8_cls.Config, "swiglu_limit")
     assert hasattr(float8_cls.Config, "swiglu_limit")
+
+
+def test_mxfp8_lm_head_excluded_by_default():
+    """An empty fqns list converts every in-layer Linear but never the LM head
+    (the last projection stays BF16 unless quantize_lm_head opts it in)."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization.mx import MXFP8Linear
+
+    config_manager = ConfigManager()
+    config = config_manager.parse_args(
+        ["--module", "llama3", "--config", "llama3_8b_mxfp8"]
+    )
+    model_config = config.model_spec.model
+
+    converted, stock = [], []
+    for fqn, lc, _parent, _attr in model_config.traverse(Linear.Config):
+        (converted if isinstance(lc, MXFP8Linear.Config) else stock).append(fqn)
+    assert converted and all("layers" in fqn for fqn in converted)
+    assert stock == ["lm_head"]
+
+
+def test_mxfp8_lm_head_opt_in():
+    """quantize_lm_head=True converts the LM head regardless of the fqns
+    include-list (the deepseek recipe's list does not match 'lm_head')."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization.mx import MXFP8Linear
+
+    config_manager = ConfigManager()
+    config = config_manager.parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel_mxfp8_lm_head"]
+    )
+    model_config = config.model_spec.model
+
+    assert isinstance(model_config.lm_head, MXFP8Linear.Config)
+    # The include-list still governs everything else: the router gate is stock.
+    gates = [
+        fqn
+        for fqn, lc, _parent, _attr in model_config.traverse(Linear.Config)
+        if "router.gate" in fqn and not isinstance(lc, MXFP8Linear.Config)
+    ]
+    assert gates
+
+
+def test_mxfp8_lm_head_rejects_weight_tying():
+    """The embedding aliases a tied lm_head weight, so opting the head into
+    MXFP8 under weight tying is rejected at convert time."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization.mx import MXFP8LinearConverter
+    from torchtitan.models.llama3 import model_registry as llama3_model_registry
+
+    model_config = llama3_model_registry("debugmodel").model
+    model_config.enable_weight_tying = True
+    converter = MXFP8LinearConverter(
+        MXFP8LinearConverter.Config(model_compile_enabled=True, quantize_lm_head=True)
+    )
+    with pytest.raises(ValueError, match="enable_weight_tying"):
+        converter.convert(model_config)

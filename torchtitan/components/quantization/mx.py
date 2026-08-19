@@ -33,8 +33,6 @@ try:
         class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds MXFP8Linear."""
 
-            pass
-
         def __init__(self, config: Config):
             TorchAOMXFP8Linear.__init__(
                 self,
@@ -56,7 +54,19 @@ class MXFP8LinearConverter(QuantizationConverter):
         """
         List of fully qualified names of modules to apply MXFP8 quantization to.
         Only Linear.Config entries whose FQN contains a match are converted.
-        If empty, all Linear modules are converted.
+        If empty, all Linear modules are converted. The LM head is governed
+        solely by ``quantize_lm_head`` and never by this list.
+        """
+
+        quantize_lm_head: bool = False
+        """
+        If True, also run the LM-head output projection (hidden -> vocab)
+        in MXFP8. Off by default: the final projection is precision-sensitive
+        and every quantization recipe in the tree (float8 filter_fqns, NVFP4)
+        keeps it in BF16 unless explicitly opted in. When False the ``lm_head``
+        config is left stock even when ``fqns`` is empty or matches it; when
+        True it is converted regardless of ``fqns``. Incompatible with
+        ``enable_weight_tying`` (the embedding aliases the lm_head weight).
         """
 
     def __init__(self, config: Config):
@@ -79,22 +89,38 @@ class MXFP8LinearConverter(QuantizationConverter):
     def convert(self, model_config):
         assert MXFP8Linear is not None
         fqns = self.config.fqns
+        if self.config.quantize_lm_head and getattr(
+            model_config, "enable_weight_tying", False
+        ):
+            raise ValueError(
+                "quantize_lm_head is incompatible with enable_weight_tying: "
+                "the token embedding aliases the lm_head weight, so the "
+                "quantized module would own the shared parameter."
+            )
         for fqn, config, parent, attr in model_config.traverse(Linear.Config):
-            if not fqns or any(target_fqn in fqn for target_fqn in fqns):
-                new_config = MXFP8Linear.Config(
-                    in_features=config.in_features,
-                    out_features=config.out_features,
-                    bias=config.bias,
-                    param_init=config.param_init,
-                )
-                if parent is None:
-                    model_config = new_config
-                elif isinstance(parent, list):
-                    parent[attr] = new_config
-                else:
-                    setattr(parent, attr, new_config)
+            if fqn == "lm_head" or fqn.endswith(".lm_head"):
+                # The LM head has a dedicated opt-in and ignores ``fqns``.
+                if not self.config.quantize_lm_head:
+                    continue
+            elif fqns and not any(target_fqn in fqn for target_fqn in fqns):
+                continue
+            new_config = MXFP8Linear.Config(
+                in_features=config.in_features,
+                out_features=config.out_features,
+                bias=config.bias,
+                param_init=config.param_init,
+            )
+            if parent is None:
+                model_config = new_config
+            elif isinstance(parent, list):
+                parent[attr] = new_config
+            else:
+                setattr(parent, attr, new_config)
 
-        logger.info("Converted Linear layers to MXFP8Linear")
+        logger.info(
+            "Converted Linear layers to MXFP8Linear"
+            + (" (including lm_head)" if self.config.quantize_lm_head else "")
+        )
         return model_config
 
 
