@@ -49,7 +49,7 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10,
     pytest.skip("Requires CUDA SM 10.0 (Blackwell)", allow_module_level=True)
 
 try:
-    import torchao.prototype.moe_training.mxfp8_grouped_mlp as _kernels
+    import torchao.prototype.moe_training.kernels.mxfp8.grouped_mlp_ops as _kernels
 except ImportError:
     pytest.skip(
         "torchao cuDNN grouped-MLP op module not importable",

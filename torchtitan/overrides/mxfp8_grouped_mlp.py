@@ -67,7 +67,7 @@ from torchao.prototype.moe_training.kernels.mxfp8 import (
 
 # Importing the wrapper module registers the four torchao:: custom ops; the
 # cudnn package is only imported lazily inside the op bodies at first launch.
-from torchao.prototype.moe_training.mxfp8_grouped_mlp import (
+from torchao.prototype.moe_training.kernels.mxfp8.grouped_mlp_ops import (
     _mxfp8_grouped_mlp_kernels_available,
     is_supported,
 )
