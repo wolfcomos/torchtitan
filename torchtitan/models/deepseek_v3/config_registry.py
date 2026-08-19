@@ -7,7 +7,7 @@
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
 from torchtitan.components.quantization import (
     Float8GroupedExpertsConverter,
     Float8LinearConverter,
@@ -131,10 +131,10 @@ def deepseek_v3_debugmodel_mxfp8_p256() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_debugmodel_mxfp8_cudnn_mlp() -> Trainer.Config:
+def deepseek_v3_debugmodel_mxfp8_grouped_mlp() -> Trainer.Config:
     # Fused arm of deepseek_v3_debugmodel_mxfp8_p256: the override swaps the
     # converter-produced MXFP8 inner experts for the cudnn-frontend fused
-    # composite (torchtitan/overrides/cudnn_grouped_mlp.py) when its gates
+    # composite (torchtitan/overrides/mxfp8_grouped_mlp.py) when its gates
     # pass; the converter keeps the dense MXFP8Linear swap and the
     # pad_multiple=256 token dispatcher. disable_cuda_graphs is required by
     # the TorchAOTokenDispatcher under EP>1; moe_force_load_balance keeps the
@@ -142,7 +142,7 @@ def deepseek_v3_debugmodel_mxfp8_cudnn_mlp() -> Trainer.Config:
     # arm compare a constant R (and avoid cudnn FE JIT churn per new R).
     config = deepseek_v3_debugmodel_mxfp8_p256()
     config.override.imports.append(
-        "torchtitan.overrides.cudnn_grouped_mlp.cudnn_mxfp8_grouped_experts"
+        "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
     )
     config.training.disable_cuda_graphs = True
     config.debug.moe_force_load_balance = True
@@ -290,12 +290,12 @@ def deepseek_v3_16b_mxfp8_p256() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_16b_mxfp8_cudnn_mlp() -> Trainer.Config:
+def deepseek_v3_16b_mxfp8_grouped_mlp() -> Trainer.Config:
     # Fused arm of deepseek_v3_16b_mxfp8_p256; differs ONLY in the override
     # import.
     config = deepseek_v3_16b_mxfp8_p256()
     config.override.imports.append(
-        "torchtitan.overrides.cudnn_grouped_mlp.cudnn_mxfp8_grouped_experts"
+        "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
     )
     return config
 

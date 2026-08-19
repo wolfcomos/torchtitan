@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """Tests for the cuDNN-frontend MXFP8 fused grouped-MLP override
-(cudnn_grouped_mlp.py).
+(mxfp8_grouped_mlp.py).
 
 The five groups (DESIGN §5, torchtitan suite):
 
@@ -49,28 +49,27 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10,
     pytest.skip("Requires CUDA SM 10.0 (Blackwell)", allow_module_level=True)
 
 try:
-    import torchao.prototype.moe_training.cudnn_grouped_mlp as _kernels
+    import torchao.prototype.moe_training.mxfp8_grouped_mlp as _kernels
 except ImportError:
     pytest.skip(
         "torchao cuDNN grouped-MLP op module not importable",
         allow_module_level=True,
     )
 
-if not _kernels._cudnn_grouped_mlp_available:
+if not _kernels._mxfp8_grouped_mlp_kernels_available:
     pytest.skip(
         "torchao cuDNN grouped-MLP ops unavailable (cudnn-frontend >= 1.27 "
         "with grouped_gemm_*_wrapper_sm100 required)",
         allow_module_level=True,
     )
 
-if importlib.util.find_spec("torchtitan.overrides.cudnn_grouped_mlp") is None:
+if importlib.util.find_spec("torchtitan.overrides.mxfp8_grouped_mlp") is None:
     pytest.skip(
-        "torchtitan.overrides.cudnn_grouped_mlp module under construction",
+        "torchtitan.overrides.mxfp8_grouped_mlp module under construction",
         allow_module_level=True,
     )
 
-from torch.profiler import profile, ProfilerActivity
-
+from torch.profiler import ProfilerActivity, profile
 from torchao.prototype.mx_formats.config import ScaleCalculationMode
 from torchao.prototype.mx_formats.mx_tensor import to_mx
 from torchao.prototype.mx_formats.utils import to_blocked
@@ -84,21 +83,21 @@ from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
 from torchtitan.models.deepseek_v3.config_registry import (
     deepseek_v3_debugmodel,
     deepseek_v3_debugmodel_mxfp8,
-    deepseek_v3_debugmodel_mxfp8_cudnn_mlp,
+    deepseek_v3_debugmodel_mxfp8_grouped_mlp,
 )
-from torchtitan.overrides.cudnn_grouped_mlp import (
-    _make_cudnn_w13_init,
-    cudnn_mxfp8_fused_grouped_mlp,
-    CudnnMXFP8FusedGroupedExperts,
+from torchtitan.overrides.mxfp8_grouped_mlp import (
+    MXFP8FusedGroupedExperts,
+    _make_w13_init,
+    mxfp8_fused_grouped_mlp,
 )
 
 # The frozen activation string (design §2.3).
-_OVERRIDE_TARGET = "torchtitan.overrides.cudnn_grouped_mlp.cudnn_mxfp8_grouped_experts"
+_OVERRIDE_TARGET = "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
 
-_OP_FWD = "torchao::mxfp8_cudnn_grouped_mlp_fwd"
-_OP_MM = "torchao::mxfp8_cudnn_grouped_mm"
-_OP_BWD = "torchao::mxfp8_cudnn_grouped_mlp_bwd"
-_OP_WGRAD = "torchao::mxfp8_cudnn_grouped_mlp_wgrad"
+_OP_FWD = "torchao::mxfp8_grouped_gemm_swiglu_fwd"
+_OP_MM = "torchao::mxfp8_grouped_gemm"
+_OP_BWD = "torchao::mxfp8_grouped_gemm_dswiglu_bwd"
+_OP_WGRAD = "torchao::mxfp8_grouped_gemm_wgrad"
 _ALL_OPS = (_OP_FWD, _OP_MM, _OP_BWD, _OP_WGRAD)
 
 _BLOCK = 32
@@ -404,7 +403,7 @@ def test_composite_matches_quantized_unfused_reference(case):
     x = fx["x"].clone().detach().requires_grad_(True)
     w13 = fx["w13"].clone().detach().requires_grad_(True)
     w2 = fx["w2"].clone().detach().requires_grad_(True)
-    y = cudnn_mxfp8_fused_grouped_mlp(x, w13, w2, fx["offsets"])
+    y = mxfp8_fused_grouped_mlp(x, w13, w2, fx["offsets"])
     assert y.shape == (r, d)
     assert y.dtype == torch.bfloat16
     y.backward(fx["dy"])
@@ -458,7 +457,7 @@ def _routed_experts_nodes(config):
 
 
 def test_composition_fired_on_named_config():
-    config = deepseek_v3_debugmodel_mxfp8_cudnn_mlp()
+    config = deepseek_v3_debugmodel_mxfp8_grouped_mlp()
     # The activation string is part of the frozen interface.
     assert _OVERRIDE_TARGET in config.override.imports
     _prepare(config)
@@ -468,14 +467,14 @@ def test_composition_fired_on_named_config():
     nodes = _routed_experts_nodes(config)
     assert nodes
     for _fqn, cfg, _parent, _attr in nodes:
-        assert type(cfg.inner_experts) is CudnnMXFP8FusedGroupedExperts.Config
+        assert type(cfg.inner_experts) is MXFP8FusedGroupedExperts.Config
         assert isinstance(cfg.token_dispatcher, TorchAOTokenDispatcher.Config)
         assert cfg.token_dispatcher.pad_multiple == 256
 
     # Module TYPE is the accepted activation evidence (never log text).
     with torch.device("meta"):
         experts = nodes[0][1].inner_experts.build()
-    assert type(experts) is CudnnMXFP8FusedGroupedExperts
+    assert type(experts) is MXFP8FusedGroupedExperts
 
 
 def test_composition_declines_pad_multiple_128_dispatcher(caplog):
@@ -539,7 +538,7 @@ _MOD_SIZES = [256, 512, 256, 256]
 
 def _build_module(seed):
     torch.manual_seed(seed)
-    module = CudnnMXFP8FusedGroupedExperts.Config(
+    module = MXFP8FusedGroupedExperts.Config(
         dim=_MOD_D, hidden_dim=_MOD_F, num_experts=_MOD_E
     ).build()
     module = module.to("cuda")
@@ -684,7 +683,7 @@ def test_remap_round_trip_identity():
 
 def test_param_init_remap_initializes_gate_and_up_blocks():
     t = torch.empty(2, 2 * 64, 8)
-    init = _make_cudnn_w13_init(
+    init = _make_w13_init(
         lambda w: torch.nn.init.constant_(w, 1.0),
         lambda w: torch.nn.init.constant_(w, 2.0),
     )

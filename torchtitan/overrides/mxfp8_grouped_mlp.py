@@ -12,12 +12,12 @@ The composite autograd Function runs the full routed-expert SwiGLU MLP with
 four torchao custom ops that wrap the ``cudnn.grouped_gemm_*_wrapper_sm100``
 CuTe DSL kernels (cuDNN frontend >= 1.27, no TransformerEngine involved):
 
-* forward:  casts -> ``torchao::mxfp8_cudnn_grouped_mlp_fwd`` (FC1 grouped
+* forward:  casts -> ``torchao::mxfp8_grouped_gemm_swiglu_fwd`` (FC1 grouped
   GEMM + SwiGLU + rowwise/colwise MXFP8 RCEIL quantization of the activation)
-  -> ``torchao::mxfp8_cudnn_grouped_mm`` FC2.
-* backward: casts -> ``torchao::mxfp8_cudnn_grouped_mlp_bwd`` (FC2 dgrad +
-  dSwiGLU + dual quantization) -> ``torchao::mxfp8_cudnn_grouped_mm`` FC1
-  dgrad -> ``torchao::mxfp8_cudnn_grouped_mlp_wgrad`` twice.
+  -> ``torchao::mxfp8_grouped_gemm`` FC2.
+* backward: casts -> ``torchao::mxfp8_grouped_gemm_dswiglu_bwd`` (FC2 dgrad +
+  dSwiGLU + dual quantization) -> ``torchao::mxfp8_grouped_gemm`` FC1
+  dgrad -> ``torchao::mxfp8_grouped_gemm_wgrad`` twice.
 
 Every cast in this module is non-CuTe (triton/CUDA-extension torchao kernels);
 only the cudnn package's own kernels are CuTe DSL. This module must never call
@@ -43,7 +43,7 @@ still save/load the stock ``w1_EFD``/``w3_EFD`` layout through this module's
 state-dict hooks.
 
 Activate with ``--override.imports
-torchtitan.overrides.cudnn_grouped_mlp.cudnn_mxfp8_grouped_experts`` on a
+torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts`` on a
 config whose experts were converted by ``MXFP8GroupedExpertsConverter``
 (``pad_multiple=256``, recipe ``mxfp8_rceil``). When any gate fails the
 factory warns with the specific reason and leaves the config unchanged, so
@@ -60,16 +60,16 @@ from dataclasses import dataclass
 
 import torch
 from torch.distributed.tensor import DTensor
-
-# Importing the wrapper module registers the four torchao:: custom ops; the
-# cudnn package is only imported lazily inside the op bodies at first launch.
-from torchao.prototype.moe_training.cudnn_grouped_mlp import (
-    _cudnn_grouped_mlp_available,
-    is_supported,
-)
 from torchao.prototype.moe_training.kernels.mxfp8 import (
     triton_mx_block_rearrange_2d_K_groups,
     triton_mx_block_rearrange_per_group_3d,
+)
+
+# Importing the wrapper module registers the four torchao:: custom ops; the
+# cudnn package is only imported lazily inside the op bodies at first launch.
+from torchao.prototype.moe_training.mxfp8_grouped_mlp import (
+    _mxfp8_grouped_mlp_kernels_available,
+    is_supported,
 )
 from torchao.prototype.mx_formats.config import (
     MXFP8Dim1CastKernelChoice,
@@ -90,9 +90,9 @@ from torchtitan.overrides.fused_swiglu import _fuse_w13_grouped_experts_sharding
 from torchtitan.tools.logging import logger
 
 __all__ = [
-    "CudnnMXFP8FusedGroupedExperts",
-    "cudnn_mxfp8_fused_grouped_mlp",
-    "cudnn_mxfp8_grouped_experts",
+    "MXFP8FusedGroupedExperts",
+    "mxfp8_fused_grouped_mlp",
+    "mxfp8_grouped_experts",
 ]
 
 _BLOCK_SIZE = 32
@@ -214,7 +214,7 @@ def _cast_colwise_grouped(
     return mx.qdata.t(), col_scales.reshape(-1)[: n_pad * (r // _BLOCK_SIZE)]
 
 
-class _CudnnMXFP8GroupedMLP(torch.autograd.Function):
+class _MXFP8GroupedMLP(torch.autograd.Function):
     """Composite MXFP8 grouped SwiGLU MLP over the four cudnn-FE ops.
 
     All inputs are plain BF16 CUDA tensors (the module prologue casts and
@@ -239,7 +239,7 @@ class _CudnnMXFP8GroupedMLP(torch.autograd.Function):
         x_row_q, x_row_sf = _cast_rowwise(x)
         w13_row_q, w13_row_sf = _cast_weight_rowwise_3d(w13)
         z, h_row_q, h_row_sf, h_col_q, h_col_sf = (
-            torch.ops.torchao.mxfp8_cudnn_grouped_mlp_fwd(
+            torch.ops.torchao.mxfp8_grouped_gemm_swiglu_fwd(
                 x_row_q,
                 x_row_sf,
                 w13_row_q,
@@ -250,7 +250,7 @@ class _CudnnMXFP8GroupedMLP(torch.autograd.Function):
         w2_row_q, w2_row_sf = _cast_weight_rowwise_3d(w2)
         # FC2 forward: b [G, N=D, K=F] rowwise (quantized along F = the
         # contraction), row-major as cast.
-        y = torch.ops.torchao.mxfp8_cudnn_grouped_mm(
+        y = torch.ops.torchao.mxfp8_grouped_gemm(
             h_row_q,
             h_row_sf,
             w2_row_q,
@@ -277,7 +277,7 @@ class _CudnnMXFP8GroupedMLP(torch.autograd.Function):
         # ABI takes the [G, D, F]-logical cast output as-is.
         w2_col_q, w2_col_sf = _cast_weight_colwise_3d(w2)
         dz_row_q, dz_row_sf, dz_col_q, dz_col_sf = (
-            torch.ops.torchao.mxfp8_cudnn_grouped_mlp_bwd(
+            torch.ops.torchao.mxfp8_grouped_gemm_dswiglu_bwd(
                 dy_row_q,
                 dy_row_sf,
                 w2_col_q,
@@ -291,7 +291,7 @@ class _CudnnMXFP8GroupedMLP(torch.autograd.Function):
         # call site transposes (unlike the archived _scaled_grouped_mm
         # composite whose mat2 convention was [G, K, N] and passed it as-is).
         w13_col_q, w13_col_sf = _cast_weight_colwise_3d(w13)
-        dx = torch.ops.torchao.mxfp8_cudnn_grouped_mm(
+        dx = torch.ops.torchao.mxfp8_grouped_gemm(
             dz_row_q,
             dz_row_sf,
             w13_col_q.transpose(-2, -1),
@@ -302,16 +302,16 @@ class _CudnnMXFP8GroupedMLP(torch.autograd.Function):
         x_col_q, x_col_sf = _cast_colwise_grouped(x, offsets)
         # dw2 [G, D, F] = dy^T @ h per expert; dw13 [G, 2F, D] = dz^T @ x per
         # expert, landing directly in the 32-block parameter order.
-        dw2 = torch.ops.torchao.mxfp8_cudnn_grouped_mlp_wgrad(
+        dw2 = torch.ops.torchao.mxfp8_grouped_gemm_wgrad(
             dy_col_q, dy_col_sf, h_col_q, h_col_sf, offsets
         )
-        dw13 = torch.ops.torchao.mxfp8_cudnn_grouped_mlp_wgrad(
+        dw13 = torch.ops.torchao.mxfp8_grouped_gemm_wgrad(
             dz_col_q, dz_col_sf, x_col_q, x_col_sf, offsets
         )
         return dx, dw13, dw2, None
 
 
-def cudnn_mxfp8_fused_grouped_mlp(
+def mxfp8_fused_grouped_mlp(
     x: torch.Tensor,
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -329,10 +329,10 @@ def cudnn_mxfp8_fused_grouped_mlp(
             ``offsets[-1] <= R``. Rows past ``offsets[-1]`` of ``y`` (and of
             ``dx`` in backward) are left UNWRITTEN.
     """
-    return _CudnnMXFP8GroupedMLP.apply(x, w13, w2, offsets)
+    return _MXFP8GroupedMLP.apply(x, w13, w2, offsets)
 
 
-def _make_cudnn_w13_init(gate_init, up_init):
+def _make_w13_init(gate_init, up_init):
     """Initializer for the 32-block-ordered ``w13 [E, 2F, D]`` from the stock
     per-half initializers: the gate/up halves are the alternating 32-row
     blocks, reachable as strided sub-views."""
@@ -346,7 +346,7 @@ def _make_cudnn_w13_init(gate_init, up_init):
     return _init
 
 
-def _cudnn_w13_grouped_experts_param_init(param_init: dict | None) -> dict | None:
+def _w13_grouped_experts_param_init(param_init: dict | None) -> dict | None:
     """Remap ``w1_EFD`` / ``w3_EFD`` initializers onto the 32-block ``w13``.
 
     Other entries (e.g. ``w2_EDF``) are kept as-is.
@@ -357,11 +357,11 @@ def _cudnn_w13_grouped_experts_param_init(param_init: dict | None) -> dict | Non
     w3_init = param_init.get("w3_EFD")
     fused = {k: v for k, v in param_init.items() if k not in ("w1_EFD", "w3_EFD")}
     if w1_init is not None and w3_init is not None:
-        fused["w13"] = _make_cudnn_w13_init(w1_init, w3_init)
+        fused["w13"] = _make_w13_init(w1_init, w3_init)
     return fused or None
 
 
-class CudnnMXFP8FusedGroupedExperts(GroupedExperts):
+class MXFP8FusedGroupedExperts(GroupedExperts):
     """Routed experts computed by the cudnn-FE MXFP8 grouped-MLP composite.
 
     ``w13`` has shape ``(num_experts, 2*hidden_dim, dim)`` in the cuDNN
@@ -408,7 +408,7 @@ class CudnnMXFP8FusedGroupedExperts(GroupedExperts):
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
         # The .bfloat16() casts stay OUTSIDE the Function so autograd handles
         # high-precision master-weight configs and dy reaches backward() BF16.
-        y_RD = _CudnnMXFP8GroupedMLP.apply(
+        y_RD = _MXFP8GroupedMLP.apply(
             x_RD.bfloat16(), w13.bfloat16(), w2_EDF.bfloat16(), offsets_E
         )
         return y_RD.type_as(x_RD)
@@ -440,7 +440,7 @@ class CudnnMXFP8FusedGroupedExperts(GroupedExperts):
 
 
 def _decline(reason: str) -> None:
-    logger.warning(f"cudnn_mxfp8_grouped_experts override NOT applied: {reason}")
+    logger.warning(f"mxfp8_grouped_experts override NOT applied: {reason}")
 
 
 @override(
@@ -448,7 +448,7 @@ def _decline(reason: str) -> None:
     exact=True,
     description="cuDNN-frontend fused MXFP8 grouped-MLP for routed experts.",
 )
-def cudnn_mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Config:
+def mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Config:
     """Swap converter-produced MXFP8 inner experts for the cudnn-FE composite.
 
     Targets ``RoutedExperts.Config`` because it owns BOTH the
@@ -487,7 +487,7 @@ def cudnn_mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Conf
             "'mxfp8_rceil' is supported."
         )
         return cfg
-    if not _cudnn_grouped_mlp_available:
+    if not _mxfp8_grouped_mlp_kernels_available:
         _decline(
             "torchao cuDNN-frontend grouped-MLP ops are unavailable in this "
             "environment (needs the cudnn python package >= 1.27 with the "
@@ -506,14 +506,14 @@ def cudnn_mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Conf
         )
         return cfg
 
-    fused = derive(experts, CudnnMXFP8FusedGroupedExperts.Config)
+    fused = derive(experts, MXFP8FusedGroupedExperts.Config)
     # The w1_EFD/w3_EFD -> w13 param-init remap is factory work (it is not
     # inherited through derive()); the sharding remap is the archived
     # pass-through (w1's layout onto w13 — both rank-3), never a decline:
     # deepseek EP=1 configs carry TP Shard(1) on w1_EFD unconditionally, so a
     # fused-dim-Shard decline would silently disable the override in exactly
     # the single-GPU debug mode.
-    fused.param_init = _cudnn_w13_grouped_experts_param_init(fused.param_init)
+    fused.param_init = _w13_grouped_experts_param_init(fused.param_init)
     if fused.sharding_config is not None:
         fused.sharding_config = _fuse_w13_grouped_experts_sharding(
             fused.sharding_config
