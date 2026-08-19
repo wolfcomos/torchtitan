@@ -67,10 +67,33 @@ from torchao.prototype.moe_training.kernels.mxfp8 import (
 
 # Importing the wrapper module registers the four torchao:: custom ops; the
 # cudnn package is only imported lazily inside the op bodies at first launch.
-from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_grouped_mlp import (
-    _mxfp8_grouped_mlp_kernels_available,
-    is_supported,
-)
+# The module is newer than several torchao releases, so its absence must be a
+# graceful factory decline (fallback to the converter's unfused MXFP8 path),
+# not an ImportError at override-import time. Tests skip on this flag too.
+try:
+    from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_grouped_mlp import (
+        _mxfp8_grouped_mlp_kernels_available,
+        is_supported,
+    )
+except ImportError as _exc:
+    is_supported = None
+    _TORCHAO_GROUPED_MLP_OPS_AVAILABLE = False
+    _TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON = (
+        "the installed torchao has no torchao.prototype.moe_training.kernels."
+        f"mxfp8.cutedsl_grouped_mlp module (a torchao build that ships the "
+        f"fused grouped-MLP custom ops is required): {_exc}"
+    )
+else:
+    _TORCHAO_GROUPED_MLP_OPS_AVAILABLE = bool(_mxfp8_grouped_mlp_kernels_available)
+    _TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON = (
+        ""
+        if _TORCHAO_GROUPED_MLP_OPS_AVAILABLE
+        else (
+            "torchao cuDNN-frontend grouped-MLP ops are unavailable in this "
+            "environment (needs the cudnn python package >= 1.27 with the "
+            "grouped_gemm_*_wrapper_sm100 kernels)."
+        )
+    )
 from torchao.prototype.mx_formats.config import (
     MXFP8Dim1CastKernelChoice,
     ScaleCalculationMode,
@@ -130,8 +153,8 @@ def _cast_weight_colwise_3d(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     straddle groups, and every group's N/32 scale columns are 4-multiples,
     so the swizzle packs the same per-group ``to_blocked`` bytes densely
     from the buffer start. qdata, scales, AND downstream op outputs are
-    BITWISE-equal to the archived per-group ``triton_to_mxfp8_dim1`` +
-    ``to_blocked`` loop (probe_t1a, 2026-08-19) at ~4x less time and ~6*G
+    BITWISE-equal to a naive per-group ``triton_to_mxfp8_dim1`` +
+    ``to_blocked`` loop (measured on GB200) at ~4x less time and ~6*G
     fewer launches per weight.
 
     The cast's native ``[G, N, K]`` view carries an interleaved batch
@@ -173,7 +196,7 @@ def _cast_colwise_grouped(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Ragged colwise (32x1) RCEIL cast of ``[R, N]`` for the wgrad operands:
     torchao-native qdata (``[R, N]``-logical, ``(1, R)`` strides — the cudnn
-    wgrad kernel accepts this major directly, probe-verified) + PER-GROUP
+    wgrad kernel accepts this major directly, verified on GB200) + PER-GROUP
     blocked scales via ``triton_mx_block_rearrange_2d_K_groups``.
 
     Quantizing the whole ragged tensor in one launch is safe ONLY because
@@ -288,8 +311,8 @@ class _MXFP8GroupedMLP(torch.autograd.Function):
         )
         # FC1 dgrad: b [G, N=D, K=2F] quantized along 2F. The colwise cast
         # yields [G, 2F, D]; the mm op's b orientation is [G, N, K], so the
-        # call site transposes (unlike the archived _scaled_grouped_mm
-        # composite whose mat2 convention was [G, K, N] and passed it as-is).
+        # call site transposes (unlike ``torch._scaled_grouped_mm``, whose
+        # [G, K, N] mat2 convention would take the cast output as-is).
         w13_col_q, w13_col_sf = _cast_weight_colwise_3d(w13)
         dx = torch.ops.torchao.mxfp8_grouped_gemm(
             dz_row_q,
@@ -332,16 +355,38 @@ def mxfp8_fused_grouped_mlp(
     return _MXFP8GroupedMLP.apply(x, w13, w2, offsets)
 
 
+def _stock_pair_to_w13(w1: torch.Tensor, w3: torch.Tensor) -> torch.Tensor:
+    """Stock ``w1_EFD``/``w3_EFD`` ``[E, F, D]`` pair -> the 32-block GLU
+    row-ordered ``w13 [E, 2F, D]`` (the inverse of ``_split_w13_on_save``'s
+    view)."""
+    e, f, d = w1.shape
+    return (
+        torch.stack([w1, w3], dim=2)  # [E, F, 2, D]
+        .view(e, f // 32, 32, 2, d)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(e, 2 * f, d)
+    )
+
+
 def _make_w13_init(gate_init, up_init):
     """Initializer for the 32-block-ordered ``w13 [E, 2F, D]`` from the stock
-    per-half initializers: the gate/up halves are the alternating 32-row
-    blocks, reachable as strided sub-views."""
+    per-half initializers.
+
+    The stock initializers run on stock-shaped ``(E, F, D)`` contiguous
+    temporaries — NOT on strided 32-block sub-views of ``w13`` — so
+    fan-computing initializers (e.g. ``nn.init.xavier_uniform_``) see exactly
+    the geometry the unfused module hands them; the results are then remapped
+    into the 32-block row order."""
 
     def _init(t: torch.Tensor) -> None:
         e, two_f, d = t.shape
-        v = t.view(e, two_f // 64, 2, 32, d)
-        gate_init(v[:, :, 0])  # gate (stock w1) blocks
-        up_init(v[:, :, 1])  # up (stock w3) blocks
+        f = two_f // 2
+        w1 = torch.empty(e, f, d, dtype=t.dtype, device=t.device)
+        w3 = torch.empty_like(w1)
+        gate_init(w1)  # gate (stock w1) half
+        up_init(w3)  # up (stock w3) half
+        with torch.no_grad():
+            t.copy_(_stock_pair_to_w13(w1, w3))
 
     return _init
 
@@ -405,6 +450,29 @@ class MXFP8FusedGroupedExperts(GroupedExperts):
             w13 = self.w13
             w2_EDF = self.w2_EDF
 
+        # The factory gate can only validate the GLOBAL dims (the config
+        # carries sharding placements, not mesh degrees), so the local shard
+        # dims are validated here at first call: under dense tensor
+        # parallelism (expert_parallel_degree=1, tensor_parallel_degree>1)
+        # w13/w2 are Shard(1)/Shard(2)-split on hidden_dim, and a TP degree
+        # with hidden_dim/tp not a 128-multiple would otherwise fail deep
+        # inside the first fused op launch.
+        local_f = w13.shape[1] // 2
+        local_d = w13.shape[2]
+        if local_f % _DIM_ALIGNMENT != 0 or local_d % _DIM_ALIGNMENT != 0:
+            raise ValueError(
+                f"mxfp8_grouped_experts: the LOCAL expert shard dims "
+                f"(D={local_d}, F={local_f} from w13 of local shape "
+                f"{tuple(w13.shape)}) must be positive multiples of "
+                f"{_DIM_ALIGNMENT} for the fused cuDNN-FE grouped-MLP "
+                "kernels. This typically means tensor parallelism split "
+                "hidden_dim into a non-128-multiple shard; choose a "
+                "tensor_parallel_degree such that hidden_dim / tp stays a "
+                f"multiple of {_DIM_ALIGNMENT}, or drop the "
+                "mxfp8_grouped_experts override import to use the unfused "
+                "MXFP8 path."
+            )
+
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
         # The .bfloat16() casts stay OUTSIDE the Function so autograd handles
         # high-precision master-weight configs and dy reaches backward() BF16.
@@ -428,14 +496,8 @@ class MXFP8FusedGroupedExperts(GroupedExperts):
         """Combine stock ``w1_EFD`` / ``w3_EFD`` into the 32-block ``w13``."""
         w1_key, w3_key = f"{prefix}w1_EFD", f"{prefix}w3_EFD"
         if w1_key in state_dict and w3_key in state_dict:
-            w1 = state_dict.pop(w1_key)
-            w3 = state_dict.pop(w3_key)
-            e, f, d = w1.shape
-            w13_elem = torch.stack([w1, w3], dim=2)  # [E, F, 2, D]
-            state_dict[f"{prefix}w13"] = (
-                w13_elem.view(e, f // 32, 32, 2, d)
-                .permute(0, 1, 3, 2, 4)
-                .reshape(e, 2 * f, d)
+            state_dict[f"{prefix}w13"] = _stock_pair_to_w13(
+                state_dict.pop(w1_key), state_dict.pop(w3_key)
             )
 
 
@@ -487,18 +549,18 @@ def mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Config:
             "'mxfp8_rceil' is supported."
         )
         return cfg
-    if not _mxfp8_grouped_mlp_kernels_available:
-        _decline(
-            "torchao cuDNN-frontend grouped-MLP ops are unavailable in this "
-            "environment (needs the cudnn python package >= 1.27 with the "
-            "grouped_gemm_*_wrapper_sm100 kernels)."
-        )
+    if not _TORCHAO_GROUPED_MLP_OPS_AVAILABLE:
+        _decline(_TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON)
         return cfg
     if not (
         torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
     ):
         _decline("requires CUDA device capability exactly (10, 0).")
         return cfg
+    # GLOBAL dims only: the config carries sharding placements (e.g. the TP
+    # Shard(1) on hidden_dim) but not mesh degrees, so the per-rank shard dims
+    # cannot be computed here. MXFP8FusedGroupedExperts.forward re-validates
+    # the LOCAL dims at first call and raises with the config fix.
     if not is_supported(experts.dim, experts.hidden_dim):
         _decline(
             f"is_supported(D={experts.dim}, F={experts.hidden_dim}) is False; "
@@ -508,8 +570,8 @@ def mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Config:
 
     fused = derive(experts, MXFP8FusedGroupedExperts.Config)
     # The w1_EFD/w3_EFD -> w13 param-init remap is factory work (it is not
-    # inherited through derive()); the sharding remap is the archived
-    # pass-through (w1's layout onto w13 — both rank-3), never a decline:
+    # inherited through derive()); the sharding remap simply carries w1's
+    # layout onto w13 (both rank-3, same shard axes), never a decline:
     # deepseek EP=1 configs carry TP Shard(1) on w1_EFD unconditionally, so a
     # fused-dim-Shard decline would silently disable the override in exactly
     # the single-GPU debug mode.

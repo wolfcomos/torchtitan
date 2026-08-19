@@ -7,16 +7,18 @@
 """Tests for the cuDNN-frontend MXFP8 fused grouped-MLP override
 (mxfp8_grouped_mlp.py).
 
-The five groups (DESIGN §5, torchtitan suite):
+The five test groups:
 
 1. Composite numerics: forward+backward vs an independent quantized-unfused
    reference built here from standalone RCEIL casts (``to_mx``), raw
    ``torch._scaled_grouped_mm``, and first-principles eager SwiGLU
    forward/backward -- deliberately NOT the override module's own cast
    helpers. Shapes include a D != F case, zero-token experts (asserting
-   exactly-zero param grads), and a strict inactive tail (A < R) filled with
-   deliberate garbage including NaN (the D11 attack -- critical because every
-   e2e gate is force-balanced and never exercises ragged routing).
+   exactly-zero param grads), an all-experts-empty R == 0 case (the ops'
+   documented early-outs), and a strict inactive tail (A < R) filled with
+   deliberate garbage including NaN (a NaN-poisoned-inactive-tail check --
+   critical because every e2e gate is force-balanced and never exercises
+   ragged routing).
 2. Composition: the named fused config through the real converter +
    ``apply_overrides`` pipeline, plus the decline paths (pad_multiple != 256,
    wrong recipe, stock config). Activation evidence is module/config TYPE
@@ -34,11 +36,11 @@ The five groups (DESIGN §5, torchtitan suite):
 
 Every per-expert row count in this file is a 256-multiple: the cuDNN FE
 kernels hard-code FIX_PAD_SIZE=256 and 128-multiple-only splits corrupt
-silently and NONDETERMINISTICALLY (DESIGN §0) -- there is deliberately no
-"sub-256 splits still work" fixture.
+silently and NONDETERMINISTICALLY (the corruption locus migrates between
+identical-input reruns, so no passing run proves such a split safe) -- there
+is deliberately no "sub-256 splits still work" fixture.
 """
 
-import importlib.util
 import logging
 
 import pytest
@@ -48,24 +50,19 @@ import torch.nn.functional as F
 if not (torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)):
     pytest.skip("Requires CUDA SM 10.0 (Blackwell)", allow_module_level=True)
 
-try:
-    import torchao.prototype.moe_training.kernels.mxfp8.cutedsl_grouped_mlp as _kernels
-except ImportError:
-    pytest.skip(
-        "torchao cuDNN grouped-MLP op module not importable",
-        allow_module_level=True,
-    )
+# The override module's own availability flag is the single source of truth
+# for whether the torchao fused grouped-MLP ops exist AND their cudnn-frontend
+# kernels are usable; skipping on it (with its reason) instead of a bare
+# try/except keeps a broken environment loud rather than silently skipped.
+from torchtitan.overrides.mxfp8_grouped_mlp import (
+    _TORCHAO_GROUPED_MLP_OPS_AVAILABLE,
+    _TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON,
+)
 
-if not _kernels._mxfp8_grouped_mlp_kernels_available:
+if not _TORCHAO_GROUPED_MLP_OPS_AVAILABLE:
     pytest.skip(
-        "torchao cuDNN grouped-MLP ops unavailable (cudnn-frontend >= 1.27 "
-        "with grouped_gemm_*_wrapper_sm100 required)",
-        allow_module_level=True,
-    )
-
-if importlib.util.find_spec("torchtitan.overrides.mxfp8_grouped_mlp") is None:
-    pytest.skip(
-        "torchtitan.overrides.mxfp8_grouped_mlp module under construction",
+        "torchao fused grouped-MLP ops unavailable: "
+        f"{_TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON}",
         allow_module_level=True,
     )
 
@@ -91,7 +88,7 @@ from torchtitan.overrides.mxfp8_grouped_mlp import (
     mxfp8_fused_grouped_mlp,
 )
 
-# The frozen activation string (design §2.3).
+# The activation string is part of the frozen override interface.
 _OVERRIDE_TARGET = "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
 
 _OP_FWD = "torchao::mxfp8_grouped_gemm_swiglu_fwd"
@@ -105,15 +102,14 @@ _E4M3 = torch.float8_e4m3fn
 _RCEIL = ScaleCalculationMode.RCEIL
 
 # ---------------------------------------------------------------------------
-# Test-1 tolerances (DESIGN §3: derive from the measured unfused-lane
-# variability, never copied from the archived kernel suite). Calibrated on
-# GB200 (torch 2.14 nightly, app clocks 2062 MHz) by
-# agent_scratch/cudnn_fe_torchao/calibrate_tt_tolerances.py, which runs THIS
-# file's reference against (a) an alternative reduction order of the SAME
-# unfused math (per-expert fp32 dequant-loop GEMMs consuming the reference's
-# own BF16 z/h/dz boundary values) and (b) the fp32 eager MLP, at both
-# parametrized shapes. Measured 2026-08-18 (GB200, app clocks 2062 MHz,
-# torch 2.14.0a0, TE devel image build 401656373):
+# Test-1 tolerances: derived from the measured variability of the unfused
+# lane itself, never copied from kernel-level (ao op suite) gates.
+# Calibration method (rerunnable in-place after any torch/torchao numerics
+# change): run THIS file's reference against (a) an alternative reduction
+# order of the SAME unfused math (per-expert fp32 dequant-loop GEMMs
+# consuming the reference's own BF16 z/h/dz boundary values) and (b) the
+# fp32 eager MLP, at both parametrized shapes. Measured 2026-08-18 on GB200
+# (torch 2.14.0a0 nightly, app clocks 2062 MHz):
 #
 #   output  ref-vs-alt-order (dB)   ref-vs-fp32 (dB)
 #   y       inf    / 128.16          23.70 / 23.66
@@ -126,8 +122,8 @@ _RCEIL = ScaleCalculationMode.RCEIL
 # reach that floor against any bf16-z reference: the cuDNN GLU/dGLU kernels
 # evaluate SwiGLU/dSwiGLU from their in-kernel FP32 accumulators (h is
 # quantized from f32 silu(z_f32)*up_f32; dz from f32 dh), while this
-# reference — and the real unfused baseline arm it models — round z and dh
-# to BF16 first (DESIGN §3). That one-boundary difference dominates every
+# reference — and the real unfused MXFP8 baseline it models — round z and dh
+# to BF16 first. That one-boundary difference dominates every
 # composite output; measured composite-vs-reference band (same host/session
 # as the table above):
 #
@@ -202,9 +198,10 @@ def _make_case(*, d, f, sizes, tail, seed=0):
     """Dispatcher-shaped fixture: expert-major x [R, D] with per-expert row
     counts ``sizes`` (256-multiples), offsets = inclusive cumsum, and a
     strict inactive tail of ``tail`` rows. Tail rows carry large deliberate
-    garbage plus NaN (the D11 attack): producers do not define them, kernels
-    must never let them contaminate active rows, and y/dx comparisons mask
-    them because the mm op leaves output tail rows unwritten."""
+    garbage plus NaN (a NaN-poisoning attack on the undefined inactive tail):
+    producers do not define them, kernels must never let them contaminate
+    active rows, and y/dx comparisons mask them because the mm op leaves
+    output tail rows unwritten."""
     g = len(sizes)
     a = sum(sizes)
     r = a + tail
@@ -441,6 +438,32 @@ def test_composite_matches_quantized_unfused_reference(case):
         )
 
 
+def test_composite_zero_routed_tokens():
+    # A local expert set receiving zero routed tokens (R == 0, every offset
+    # 0): the titan cast chain must produce empty quantized operands and the
+    # ops' documented R == 0 early-outs must return empty y/dx and
+    # exactly-zero weight grads without error.
+    d, f, g = 256, 256, 3
+    torch.manual_seed(8)
+    x = torch.zeros(0, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    w13 = (
+        torch.randn(g, 2 * f, d, device="cuda", dtype=torch.bfloat16) / d**0.5
+    ).requires_grad_(True)
+    w2 = (
+        torch.randn(g, d, f, device="cuda", dtype=torch.bfloat16) / d**0.5
+    ).requires_grad_(True)
+    offsets = torch.zeros(g, device="cuda", dtype=torch.int32)
+
+    y = mxfp8_fused_grouped_mlp(x, w13, w2, offsets)
+    assert y.shape == (0, d)
+    assert y.dtype == torch.bfloat16
+    y.backward(torch.zeros_like(y))
+
+    assert x.grad is not None and x.grad.shape == (0, d)
+    assert w13.grad is not None and w13.grad.abs().max().item() == 0.0
+    assert w2.grad is not None and w2.grad.abs().max().item() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # 2. Composition (config-time factory gating through the real pipeline)
 # ---------------------------------------------------------------------------
@@ -478,8 +501,9 @@ def test_composition_fired_on_named_config():
 
 
 def test_composition_declines_pad_multiple_128_dispatcher(caplog):
-    # The archived family's pad_multiple=128 is a DECLINE here: cuDNN FE
-    # FIX_PAD_SIZE is 256 and sub-256 splits corrupt nondeterministically.
+    # pad_multiple=128 (the unfused kernels' own requirement) is a DECLINE
+    # here: cuDNN FE FIX_PAD_SIZE is 256 and sub-256 splits corrupt
+    # nondeterministically.
     config = _prepare(deepseek_v3_debugmodel_mxfp8())
     config.override.imports.append(_OVERRIDE_TARGET)
     for _fqn, cfg, _parent, _attr in _routed_experts_nodes(config):
