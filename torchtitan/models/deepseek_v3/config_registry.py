@@ -290,6 +290,21 @@ def deepseek_v3_16b_mxfp8_p256() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_16b_mxfp8_p256_wgrad_hp() -> Trainer.Config:
+    # High-precision-wgrad baseline arm: routed-expert weight gradients in
+    # BF16 grouped GEMMs, everything else (fwd/dgrad, dense linears) stays
+    # MXFP8. The fused grouped-MLP override does not support this recipe and
+    # would decline it. model_registry applies converters eagerly, so the
+    # recipe is retargeted on the already-converted experts configs, like
+    # _set_routed_experts_pad_multiple.
+    config = deepseek_v3_16b_mxfp8_p256()
+    nodes = list(config.traverse(RoutedExperts.Config))
+    assert nodes, "no RoutedExperts.Config in the model tree"
+    for _fqn, cfg, _parent, _attr in nodes:
+        cfg.inner_experts.recipe_name = "mxfp8_rceil_wgrad_with_hp"
+    return config
+
+
 def deepseek_v3_16b_mxfp8_grouped_mlp() -> Trainer.Config:
     # Fused arm of deepseek_v3_16b_mxfp8_p256; differs ONLY in the override
     # import.
