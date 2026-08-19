@@ -99,6 +99,9 @@ def graph_trainer_llama3_8b_mxfp8() -> GraphTrainer.Config:
     # Swap dense Linear layers for MXFP8Linear before wrapping in the
     # graph_trainer config. graph_trainer always compiles the model, so the
     # MXFP8 converter's compile requirement is satisfied.
+    # The lm_head stays BF16: the converter excludes it unless
+    # quantize_lm_head is set (an empty fqns list previously swapped it
+    # silently, against the tree-wide last-layer-precision convention).
     base.model_spec = llama3_model_registry(
         "8B",
         converters=[MXFP8LinearConverter.Config(model_compile_enabled=True)],

@@ -355,11 +355,23 @@ def test_quantized_grouped_experts():
     assert hasattr(float8_cls.Config, "swiglu_limit")
 
 
-def test_mxfp8_lm_head_excluded_by_default():
+def _mxfp8_linear_cls(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.mx as mx_mod
+
+    if mx_mod.MXFP8Linear is None:
+        pytest.skip("torchao MXFP8 training prototype not available")
+    # Exercise convert() targeting independent of GPU: bypass the sm100 gate
+    # that the MXFP8 converters' __init__ enforces (hardware is irrelevant to
+    # the config-tree transform under test).
+    monkeypatch.setattr(mx_mod, "has_cuda_capability", lambda *_: True)
+    return mx_mod.MXFP8Linear
+
+
+def test_mxfp8_lm_head_excluded_by_default(monkeypatch):
     """An empty fqns list converts every in-layer Linear but never the LM head
     (the last projection stays BF16 unless quantize_lm_head opts it in)."""
-    pytest.importorskip("torchao")
-    from torchtitan.components.quantization.mx import MXFP8Linear
+    MXFP8Linear = _mxfp8_linear_cls(monkeypatch)
 
     config_manager = ConfigManager()
     config = config_manager.parse_args(
@@ -374,11 +386,10 @@ def test_mxfp8_lm_head_excluded_by_default():
     assert stock == ["lm_head"]
 
 
-def test_mxfp8_lm_head_opt_in():
+def test_mxfp8_lm_head_opt_in(monkeypatch):
     """quantize_lm_head=True converts the LM head regardless of the fqns
     include-list (the deepseek recipe's list does not match 'lm_head')."""
-    pytest.importorskip("torchao")
-    from torchtitan.components.quantization.mx import MXFP8Linear
+    MXFP8Linear = _mxfp8_linear_cls(monkeypatch)
 
     config_manager = ConfigManager()
     config = config_manager.parse_args(
@@ -396,10 +407,10 @@ def test_mxfp8_lm_head_opt_in():
     assert gates
 
 
-def test_mxfp8_lm_head_rejects_weight_tying():
+def test_mxfp8_lm_head_rejects_weight_tying(monkeypatch):
     """The embedding aliases a tied lm_head weight, so opting the head into
     MXFP8 under weight tying is rejected at convert time."""
-    pytest.importorskip("torchao")
+    _mxfp8_linear_cls(monkeypatch)
     from torchtitan.components.quantization.mx import MXFP8LinearConverter
     from torchtitan.models.llama3 import model_registry as llama3_model_registry
 
@@ -410,3 +421,39 @@ def test_mxfp8_lm_head_rejects_weight_tying():
     )
     with pytest.raises(ValueError, match="enable_weight_tying"):
         converter.convert(model_config)
+
+
+def test_mxfp8_lm_head_rejects_subclassed_head(monkeypatch):
+    """A Linear.Config subclass head (e.g. a soft-capped output projection)
+    would be lossily rebuilt as a plain MXFP8Linear.Config, so opting it into
+    MXFP8 is rejected at convert time with the subclass named."""
+    _mxfp8_linear_cls(monkeypatch)
+    from dataclasses import dataclass
+
+    from torchtitan.components.quantization.mx import MXFP8LinearConverter
+    from torchtitan.models.llama3 import model_registry as llama3_model_registry
+
+    class FakeSoftCappedLinear(Linear):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Linear.Config):
+            output_soft_cap: float = 30.0
+
+    model_config = llama3_model_registry("debugmodel").model
+    head = model_config.lm_head
+    model_config.lm_head = FakeSoftCappedLinear.Config(
+        in_features=head.in_features,
+        out_features=head.out_features,
+        bias=head.bias,
+    )
+    converter = MXFP8LinearConverter(
+        MXFP8LinearConverter.Config(model_compile_enabled=True, quantize_lm_head=True)
+    )
+    with pytest.raises(ValueError, match="FakeSoftCappedLinear"):
+        converter.convert(model_config)
+
+    # Without the opt-in the subclass head is left untouched (no error).
+    converter_off = MXFP8LinearConverter(
+        MXFP8LinearConverter.Config(model_compile_enabled=True)
+    )
+    converted = converter_off.convert(model_config)
+    assert type(converted.lm_head) is FakeSoftCappedLinear.Config

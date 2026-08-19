@@ -61,12 +61,15 @@ class MXFP8LinearConverter(QuantizationConverter):
         quantize_lm_head: bool = False
         """
         If True, also run the LM-head output projection (hidden -> vocab)
-        in MXFP8. Off by default: the final projection is precision-sensitive
-        and every quantization recipe in the tree (float8 filter_fqns, NVFP4)
-        keeps it in BF16 unless explicitly opted in. When False the ``lm_head``
+        in MXFP8. Off by default: the final projection is precision-sensitive,
+        so this converter keeps it in BF16 unless explicitly opted in (other
+        converters govern the head via their own fqn filters, e.g. NVFP4
+        recipes list explicit fqns). When False the ``lm_head``
         config is left stock even when ``fqns`` is empty or matches it; when
         True it is converted regardless of ``fqns``. Incompatible with
-        ``enable_weight_tying`` (the embedding aliases the lm_head weight).
+        ``enable_weight_tying`` (the embedding aliases the lm_head weight)
+        and with ``Linear.Config`` subclass heads (rebuilding one as a plain
+        ``MXFP8Linear.Config`` would drop the subclass behavior).
         """
 
     def __init__(self, config: Config):
@@ -97,11 +100,22 @@ class MXFP8LinearConverter(QuantizationConverter):
                 "the token embedding aliases the lm_head weight, so the "
                 "quantized module would own the shared parameter."
             )
+        lm_head_converted = False
         for fqn, config, parent, attr in model_config.traverse(Linear.Config):
             if fqn == "lm_head" or fqn.endswith(".lm_head"):
                 # The LM head has a dedicated opt-in and ignores ``fqns``.
                 if not self.config.quantize_lm_head:
                     continue
+                if type(config) is not Linear.Config:
+                    # A Linear.Config subclass (e.g. a soft-capped head) would
+                    # be rebuilt as a plain MXFP8Linear.Config, silently
+                    # dropping the subclass behavior.
+                    raise ValueError(
+                        "quantize_lm_head only supports plain Linear.Config "
+                        f"heads; {fqn!r} is a {type(config).__qualname__}. "
+                        "Quantizing subclassed heads is unsupported."
+                    )
+                lm_head_converted = True
             elif fqns and not any(target_fqn in fqn for target_fqn in fqns):
                 continue
             new_config = MXFP8Linear.Config(
@@ -119,7 +133,7 @@ class MXFP8LinearConverter(QuantizationConverter):
 
         logger.info(
             "Converted Linear layers to MXFP8Linear"
-            + (" (including lm_head)" if self.config.quantize_lm_head else "")
+            + (" (including lm_head)" if lm_head_converted else "")
         )
         return model_config
 

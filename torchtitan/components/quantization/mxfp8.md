@@ -66,7 +66,8 @@ model_spec = model_registry(
   * `"mxfp8_rceil"` (default): MXFP8 dynamic quantization with RCEIL rounding mode when computing the e8m0 scale factors.
   * `"mxfp8_cublas"`: Use the cuBLAS-based MXFP8 recipe for best performance on B200 GPUs.
   * `"mxfp8_cublas_rceil"`: Uses round-ceiling mode for scale calculation.
-* `fqns` (optional): List of fully qualified names to filter which Linear modules to convert. Only `Linear.Config` entries whose FQN contains a match are swapped to `MXFP8Linear.Config`. If empty, all Linear modules are converted.
+* `fqns` (optional): List of fully qualified names to filter which Linear modules to convert. Only `Linear.Config` entries whose FQN contains a match are swapped to `MXFP8Linear.Config`. If empty, all Linear modules are converted except the LM head, which is governed solely by `quantize_lm_head` and never by this list.
+* `quantize_lm_head` (default `False`): if `True`, also convert the LM-head output projection (hidden -> vocab) to MXFP8, regardless of `fqns`. Off by default because the final projection is precision-sensitive. Incompatible with `enable_weight_tying` and with `Linear.Config` subclass heads.
 * `model_compile_enabled`: set to `True` when `torch.compile` is enabled for the model (required for competitive performance).
 
 **Hardware Requirements:**
