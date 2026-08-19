@@ -145,8 +145,16 @@ class TestPermute(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _torchao_triton_row_permute_available() -> bool:
+    """Whether torchao provides the Triton row-permutation ops the parity
+    test needs (skip cleanly on machines with old or absent torchao)."""
+    try:
+        from torchtitan.models.common.token_dispatcher import (
+            _torchao_triton_row_permute_available as probe,
+        )
+    except ImportError:
+        return False
+    return probe()
 
 
 class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
@@ -178,6 +186,11 @@ class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
     @unittest.skipUnless(
         torch.cuda.is_available(), "requires CUDA (torchao Triton ops)"
     )
+    @unittest.skipUnless(
+        _torchao_triton_row_permute_available(),
+        "requires torchao with the Triton row-permutation ops "
+        "(permute_and_pad(use_triton=...) / moe_row_unpermute)",
+    )
     def test_triton_matches_eager_bitwise(self):
         torch.manual_seed(42)
         # 2 ranks x 4 local experts, uneven counts incl. an empty expert.
@@ -190,19 +203,21 @@ class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
             num_tokens, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
         x_eager_RD = x_RD.detach().clone().requires_grad_(True)
-        grad_seed = None
+        grad_out = None
         results = {}
         for use_triton, x_in in ((True, x_RD), (False, x_eager_RD)):
             dispatcher = self._make_dispatcher(2, use_triton)
-            input_shape, permuted_RD, permuted_indices, counts_padded_e = (
-                dispatcher._permute(x_in, counts_E)
-            )
-            if grad_seed is None:
-                grad_seed = torch.randn_like(permuted_RD)
+            permute_out = dispatcher._permute(x_in, counts_E)
+            input_shape, permuted_RD, permuted_indices, counts_padded_e = permute_out
             unpermuted_RD = dispatcher._unpermute(
                 permuted_RD, input_shape, permuted_indices
             )
-            unpermuted_RD.backward(torch.ones_like(unpermuted_RD), retain_graph=False)
+            # Random cotangent, shared by both arms so the bitwise backward
+            # parity actually discriminates permutation-index bugs (an all-ones
+            # cotangent is invariant under any valid-index permutation).
+            if grad_out is None:
+                grad_out = torch.randn_like(unpermuted_RD)
+            unpermuted_RD.backward(grad_out, retain_graph=False)
             results[use_triton] = (
                 input_shape,
                 permuted_RD.detach(),
@@ -216,3 +231,7 @@ class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
             else:
                 self.assertEqual(a, b)
         torch.testing.assert_close(x_RD.grad, x_eager_RD.grad, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    unittest.main()
