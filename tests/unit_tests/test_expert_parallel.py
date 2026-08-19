@@ -147,3 +147,72 @@ class TestPermute(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
+    """TorchAOTokenDispatcher's padded permute: Triton row-permute op vs the
+    eager advanced-indexing fallback must match bitwise, forward and backward
+    (a row permutation is a pure copy)."""
+
+    def _make_dispatcher(self, num_ranks: int, use_triton: bool):
+        from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
+
+        cfg = TorchAOTokenDispatcher.Config(
+            num_experts=8,
+            top_k=1,
+            pad_multiple=32,
+            use_triton_row_permute=use_triton,
+        )
+        dispatcher = TorchAOTokenDispatcher(cfg)
+        mock_mesh = unittest.mock.MagicMock()
+        mock_mesh.size.return_value = num_ranks
+        dispatcher.ep_mesh = mock_mesh
+        return dispatcher
+
+    def test_config_defaults_to_triton(self):
+        from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
+
+        cfg = TorchAOTokenDispatcher.Config(num_experts=8, top_k=1, pad_multiple=32)
+        self.assertTrue(cfg.use_triton_row_permute)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "requires CUDA (torchao Triton ops)"
+    )
+    def test_triton_matches_eager_bitwise(self):
+        torch.manual_seed(42)
+        # 2 ranks x 4 local experts, uneven counts incl. an empty expert.
+        counts_E = torch.tensor(
+            [40, 0, 17, 71, 5, 33, 60, 30], dtype=torch.int32, device="cuda"
+        )
+        num_tokens = int(counts_E.sum())
+        dim = 256
+        x_RD = torch.randn(
+            num_tokens, dim, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        x_eager_RD = x_RD.detach().clone().requires_grad_(True)
+        grad_seed = None
+        results = {}
+        for use_triton, x_in in ((True, x_RD), (False, x_eager_RD)):
+            dispatcher = self._make_dispatcher(2, use_triton)
+            input_shape, permuted_RD, permuted_indices, counts_padded_e = (
+                dispatcher._permute(x_in, counts_E)
+            )
+            if grad_seed is None:
+                grad_seed = torch.randn_like(permuted_RD)
+            unpermuted_RD = dispatcher._unpermute(
+                permuted_RD, input_shape, permuted_indices
+            )
+            unpermuted_RD.backward(torch.ones_like(unpermuted_RD), retain_graph=False)
+            results[use_triton] = (
+                input_shape,
+                permuted_RD.detach(),
+                permuted_indices,
+                counts_padded_e,
+                unpermuted_RD.detach(),
+            )
+        for a, b in zip(results[True], results[False]):
+            if isinstance(a, torch.Tensor):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+            else:
+                self.assertEqual(a, b)
+        torch.testing.assert_close(x_RD.grad, x_eager_RD.grad, rtol=0, atol=0)

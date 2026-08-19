@@ -15,10 +15,16 @@ from torch.distributed.tensor import DeviceMesh
 
 from torchtitan.config import Configurable
 from torchtitan.distributed.minimal_async_ep import (
-    combine_op as minimal_async_ep_combine_op,
-    dispatch_op as minimal_async_ep_dispatch_op,
-    init_buffer as minimal_async_ep_init_buffer,
     MinimalAsyncEPDispatchMetadata,
+)
+from torchtitan.distributed.minimal_async_ep import (
+    combine_op as minimal_async_ep_combine_op,
+)
+from torchtitan.distributed.minimal_async_ep import (
+    dispatch_op as minimal_async_ep_dispatch_op,
+)
+from torchtitan.distributed.minimal_async_ep import (
+    init_buffer as minimal_async_ep_init_buffer,
 )
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
@@ -30,8 +36,8 @@ from torchtitan.tools.utils import device_module, device_type
 class LocalDispatchMetadata:
     """Metadata returned by LocalTokenDispatcher.dispatch() for use in combine()."""
 
-    token_indices_experts_sorted_N: torch.Tensor  # noqa: N815
-    topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815
+    token_indices_experts_sorted_N: torch.Tensor
+    topk_scores_experts_sorted_N: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -647,9 +653,17 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
     class Config(AllToAllTokenDispatcher.Config):
         pad_multiple: int
 
+        use_triton_row_permute: bool = True
+        """Use torchao's Triton row-permutation ops for the padded permute and
+        its inverse (one row-copy launch per direction; the backward is an
+        explicit scatter instead of aten's accumulate-mode index_put). False
+        keeps the eager advanced-indexing implementation -- a controlled
+        fallback for numerics/perf A/B, bitwise-equivalent on valid rows."""
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.pad_multiple = config.pad_multiple
+        self.use_triton_row_permute = config.use_triton_row_permute
 
     def dispatch(
         self,
@@ -760,6 +774,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
             ep_size,
             e,
             self.pad_multiple,
+            use_triton=self.use_triton_row_permute,
         )
         return (
             input_shape,
@@ -769,7 +784,16 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         )
 
     def _unpermute(self, routed_output_RD, input_shape, permuted_indices):
-        # Strip the padding sentinel row added by permute_and_pad
+        if self.use_triton_row_permute:
+            # One scatter launch; -1 padding entries write nothing (input_shape
+            # carries the sentinel-inclusive row count, hence the -1).
+            from torchao.prototype.moe_training.ep.permute import moe_row_unpermute
+
+            return moe_row_unpermute(
+                routed_output_RD.contiguous(), permuted_indices, input_shape[0] - 1
+            )
+        # Eager fallback: -1 entries scatter into the sentinel row, which the
+        # slice then strips.
         out_unpermuted_RD = routed_output_RD.new_empty(input_shape)
         out_unpermuted_RD[permuted_indices, :] = routed_output_RD
         return out_unpermuted_RD[:-1]
@@ -1177,7 +1201,7 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
         """Combine tokens via MinimalAsyncEP."""
         del x_TD
         state = cast(MinimalAsyncEPDispatchMetadata, metadata.state)
-        combined_TD, _routed_output_ND = minimal_async_ep_combine_op(  # noqa: N806
+        combined_TD, _routed_output_ND = minimal_async_ep_combine_op(
             routed_output_RD,
             state.dispatch_dst_ranks,
             state.dispatch_dst_rows,
