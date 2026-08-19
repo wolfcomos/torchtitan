@@ -292,6 +292,13 @@ class _MXFP8GroupedMLP(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy: torch.Tensor):
         z, h_col_q, h_col_sf, x, offsets, w13, w2 = ctx.saved_tensors
+        if x.shape[0] == 0:
+            # A rank whose local experts received zero routed tokens: every
+            # grad is zero by construction, and torchao's CUDA colwise cast
+            # rejects 0-row inputs, so skip the cast/GEMM chain outright.
+            # (The forward needs no such guard: its rowwise casts accept 0
+            # rows and the ops early-return at R == 0.)
+            return torch.empty_like(x), torch.zeros_like(w13), torch.zeros_like(w2), None
         # The casts assert contiguity; dy is contiguous today (BF16 [R, D]
         # stride (D, 1)) but that is a live invariant, not a given.
         dy = dy.contiguous()
