@@ -678,11 +678,6 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         pad_multiple: int
 
         use_triton_row_permute: bool = True
-        """Use torchao's Triton row-permutation ops for the padded permute and
-        its inverse (one row-copy launch per direction; the backward is an
-        explicit scatter instead of aten's accumulate-mode index_put). False
-        keeps the eager advanced-indexing implementation -- a controlled
-        fallback for numerics/perf A/B, bitwise-equivalent on valid rows."""
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -1246,7 +1241,7 @@ class MinimalAsyncEPTokenDispatcher(BaseEPTokenDispatcher):
         """Combine tokens via MinimalAsyncEP."""
         del x_TD
         state = cast(MinimalAsyncEPDispatchMetadata, metadata.state)
-        combined_TD, _routed_output_ND = minimal_async_ep_combine_op(
+        combined_TD, _routed_output_ND = minimal_async_ep_combine_op(  # noqa: N806
             routed_output_RD,
             state.dispatch_dst_ranks,
             state.dispatch_dst_rows,
