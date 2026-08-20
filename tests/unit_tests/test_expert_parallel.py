@@ -189,7 +189,7 @@ class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
     @unittest.skipUnless(
         _torchao_triton_row_permute_available(),
         "requires torchao with the Triton row-permutation ops "
-        "(permute_and_pad(use_triton=...) / moe_row_unpermute)",
+        "(permute_and_pad(use_triton=...) / triton_unpermute)",
     )
     def test_triton_matches_eager_bitwise(self):
         torch.manual_seed(42)

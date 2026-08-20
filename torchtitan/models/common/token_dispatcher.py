@@ -33,7 +33,7 @@ _torchao_triton_row_permute_warned: bool = False
 def _torchao_triton_row_permute_available() -> bool:
     """Whether the installed torchao has the Triton row-permutation ops.
 
-    Requires torchao's ``moe_row_unpermute`` to be importable and
+    Requires torchao's ``triton_unpermute`` to be importable and
     ``permute_and_pad`` to accept the ``use_triton`` kwarg. Older torchao
     builds (which TorchAOTokenDispatcher otherwise supports) have neither;
     the result is probed once and cached.
@@ -44,8 +44,8 @@ def _torchao_triton_row_permute_available() -> bool:
             import inspect
 
             from torchao.prototype.moe_training.ep.permute import (  # noqa: F401
-                moe_row_unpermute,
                 permute_and_pad,
+                triton_unpermute,
             )
 
             _torchao_triton_row_permute_probe = (
@@ -694,7 +694,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
                 logger.warning(
                     "use_triton_row_permute=True but the installed torchao does "
                     "not provide the Triton row-permutation ops (permute_and_pad "
-                    "with a use_triton kwarg and moe_row_unpermute in "
+                    "with a use_triton kwarg and triton_unpermute in "
                     "torchao.prototype.moe_training.ep.permute); falling back to "
                     "the eager implementation. Upgrade torchao to enable the "
                     "Triton path."
@@ -832,9 +832,9 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         if self.use_triton_row_permute:
             # One scatter launch; -1 padding entries write nothing (input_shape
             # carries the sentinel-inclusive row count, hence the -1).
-            from torchao.prototype.moe_training.ep.permute import moe_row_unpermute
+            from torchao.prototype.moe_training.ep.permute import triton_unpermute
 
-            return moe_row_unpermute(
+            return triton_unpermute(
                 routed_output_RD.contiguous(), permuted_indices, input_shape[0] - 1
             )
         # Eager fallback: -1 entries scatter into the sentinel row, which the
