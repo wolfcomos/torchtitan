@@ -23,37 +23,7 @@ from torchtitan.distributed.minimal_async_ep import (
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.ops.scatter_add import deterministic_scatter_add
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module, device_type
-
-_torchao_triton_row_permute_probe: bool | None = None
-_torchao_triton_row_permute_warned: bool = False
-
-
-def _torchao_triton_row_permute_available() -> bool:
-    """Whether the installed torchao has the Triton row-permutation ops.
-
-    Requires torchao's ``triton_unpermute`` to be importable and
-    ``permute_and_pad`` to accept the ``use_triton`` kwarg. Older torchao
-    builds (which TorchAOTokenDispatcher otherwise supports) have neither;
-    the result is probed once and cached.
-    """
-    global _torchao_triton_row_permute_probe
-    if _torchao_triton_row_permute_probe is None:
-        try:
-            import inspect
-
-            from torchao.prototype.moe_training.ep.permute import (  # noqa: F401
-                permute_and_pad,
-                triton_unpermute,
-            )
-
-            _torchao_triton_row_permute_probe = (
-                "use_triton" in inspect.signature(permute_and_pad).parameters
-            )
-        except ImportError:
-            _torchao_triton_row_permute_probe = False
-    return _torchao_triton_row_permute_probe
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -683,19 +653,6 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         super().__init__(config)
         self.pad_multiple = config.pad_multiple
         self.use_triton_row_permute = config.use_triton_row_permute
-        if self.use_triton_row_permute and not _torchao_triton_row_permute_available():
-            global _torchao_triton_row_permute_warned
-            if not _torchao_triton_row_permute_warned:
-                logger.warning(
-                    "use_triton_row_permute=True but the installed torchao does "
-                    "not provide the Triton row-permutation ops (permute_and_pad "
-                    "with a use_triton kwarg and triton_unpermute in "
-                    "torchao.prototype.moe_training.ep.permute); falling back to "
-                    "the eager implementation. Upgrade torchao to enable the "
-                    "Triton path."
-                )
-                _torchao_triton_row_permute_warned = True
-            self.use_triton_row_permute = False
 
     def dispatch(
         self,
@@ -794,14 +751,6 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
         ep_size = self.ep_mesh.size() if self.ep_mesh is not None else 1
         e = num_global_tokens_per_local_expert_E.shape[0] // ep_size
 
-        # Older torchao's permute_and_pad has no use_triton kwarg (and __init__
-        # has already forced use_triton_row_permute=False for such builds), so
-        # only pass the kwarg when the installed torchao understands it.
-        extra_kwargs: dict[str, Any] = (
-            {"use_triton": self.use_triton_row_permute}
-            if _torchao_triton_row_permute_available()
-            else {}
-        )
         (
             input_shape,
             routed_input_RD,
@@ -814,7 +763,7 @@ class TorchAOTokenDispatcher(AllToAllTokenDispatcher):
             ep_size,
             e,
             self.pad_multiple,
-            **extra_kwargs,
+            use_triton=self.use_triton_row_permute,
         )
         return (
             input_shape,

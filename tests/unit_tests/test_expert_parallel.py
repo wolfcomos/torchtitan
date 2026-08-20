@@ -145,18 +145,6 @@ class TestPermute(unittest.TestCase):
         )
 
 
-def _torchao_triton_row_permute_available() -> bool:
-    """Whether torchao provides the Triton row-permutation ops the parity
-    test needs (skip cleanly on machines with old or absent torchao)."""
-    try:
-        from torchtitan.models.common.token_dispatcher import (
-            _torchao_triton_row_permute_available as probe,
-        )
-    except ImportError:
-        return False
-    return probe()
-
-
 class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
     """TorchAOTokenDispatcher's padded permute: Triton row-permute op vs the
     eager advanced-indexing fallback must match bitwise, forward and backward
@@ -185,11 +173,6 @@ class TestTorchAOTokenDispatcherRowPermute(unittest.TestCase):
 
     @unittest.skipUnless(
         torch.cuda.is_available(), "requires CUDA (torchao Triton ops)"
-    )
-    @unittest.skipUnless(
-        _torchao_triton_row_permute_available(),
-        "requires torchao with the Triton row-permutation ops "
-        "(permute_and_pad(use_triton=...) / triton_unpermute)",
     )
     def test_triton_matches_eager_bitwise(self):
         torch.manual_seed(42)
