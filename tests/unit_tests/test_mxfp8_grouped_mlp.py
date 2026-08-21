@@ -19,10 +19,11 @@ The five test groups:
    deliberate garbage including NaN (a NaN-poisoned-inactive-tail check --
    critical because every e2e gate is force-balanced and never exercises
    ragged routing).
-2. Composition: the named fused config through the real converter +
-   ``apply_overrides`` pipeline, plus the decline paths (pad_multiple != 256,
-   wrong recipe, stock config). Activation evidence is module/config TYPE
-   only: a declined run still emits identity "[Override] ..." lines.
+2. Composition: the named fused config through the real ``apply_overrides``
+   pipeline. The override is self-contained: stock experts in, fused experts
+   plus the factory-installed pad_multiple=256 TorchAO dispatcher out, no
+   converter involved -- and fail-loud: converter-quantized experts raise
+   instead of falling back. Activation evidence is module/config TYPE only.
 3. Autograd/AC: under the real SelectiveAC policy the composite forward runs
    exactly twice (save-from-recompute), gradients match no-AC bitwise, and
    the by-reference parameter save survives optimizer.step into the next
@@ -41,7 +42,7 @@ identical-input reruns, so no passing run proves such a split safe) -- there
 is deliberately no "sub-256 splits still work" fixture.
 """
 
-import logging
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -72,13 +73,15 @@ from torchao.prototype.mx_formats.mx_tensor import to_mx
 from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.quantization.utils import compute_error
 
-from torchtitan.components.quantization.mx import _get_mxfp8_grouped_experts_cls
-from torchtitan.config import apply_overrides
+from torchtitan.config import apply_overrides, derive
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.common.moe import GroupedExperts, RoutedExperts
 from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
 from torchtitan.models.deepseek_v3.config_registry import (
+    deepseek_v3_16b_mxfp8_grouped_mlp,
+    deepseek_v3_16b_mxfp8_p256,
     deepseek_v3_debugmodel,
+    deepseek_v3_debugmodel_hybridep,
     deepseek_v3_debugmodel_mxfp8,
     deepseek_v3_debugmodel_mxfp8_grouped_mlp,
 )
@@ -86,6 +89,7 @@ from torchtitan.overrides.mxfp8_grouped_mlp import (
     MXFP8FusedGroupedExperts,
     _make_w13_init,
     mxfp8_fused_grouped_mlp,
+    mxfp8_grouped_experts,
 )
 
 # The activation string is part of the frozen override interface.
@@ -484,6 +488,11 @@ def test_composition_fired_on_named_config():
     # The activation string is part of the frozen interface.
     assert _OVERRIDE_TARGET in config.override.imports
     _prepare(config)
+    # Self-contained: before the apply, the experts are STOCK (no grouped
+    # converter ran on this flavor) and the dispatcher is not yet padded.
+    for _fqn, cfg, _parent, _attr in _routed_experts_nodes(config):
+        assert type(cfg.inner_experts) is GroupedExperts.Config
+        assert not isinstance(cfg.token_dispatcher, TorchAOTokenDispatcher.Config)
     replacements = apply_overrides(config.override, config)
     assert replacements
 
@@ -491,6 +500,7 @@ def test_composition_fired_on_named_config():
     assert nodes
     for _fqn, cfg, _parent, _attr in nodes:
         assert type(cfg.inner_experts) is MXFP8FusedGroupedExperts.Config
+        # The factory installed the padded dispatcher itself.
         assert isinstance(cfg.token_dispatcher, TorchAOTokenDispatcher.Config)
         assert cfg.token_dispatcher.pad_multiple == 256
 
@@ -500,48 +510,9 @@ def test_composition_fired_on_named_config():
     assert type(experts) is MXFP8FusedGroupedExperts
 
 
-def test_composition_declines_pad_multiple_128_dispatcher(caplog):
-    # pad_multiple=128 (the unfused kernels' own requirement) is a DECLINE
-    # here: cuDNN FE FIX_PAD_SIZE is 256 and sub-256 splits corrupt
-    # nondeterministically.
-    config = _prepare(deepseek_v3_debugmodel_mxfp8())
-    config.override.imports.append(_OVERRIDE_TARGET)
-    for _fqn, cfg, _parent, _attr in _routed_experts_nodes(config):
-        assert cfg.token_dispatcher.pad_multiple == 128
-    with caplog.at_level(logging.WARNING):
-        replacements = apply_overrides(config.override, config)
-
-    converter_cfg_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts).Config
-    nodes = _routed_experts_nodes(config)
-    assert nodes
-    for _fqn, cfg, _parent, _attr in nodes:
-        # Declined: the converter's unfused MXFP8 config stays in place.
-        assert type(cfg.inner_experts) is converter_cfg_cls
-    assert any(rec.levelno >= logging.WARNING for rec in caplog.records)
-    # The misleading-identity-log caveat: the declined apply still reports
-    # "[Override] ..." replacements, so their presence proves nothing.
-    assert replacements
-
-
-def test_composition_declines_wrong_recipe(caplog):
-    config = _prepare(deepseek_v3_debugmodel_mxfp8())
-    config.override.imports.append(_OVERRIDE_TARGET)
-    for _fqn, cfg, _parent, _attr in _routed_experts_nodes(config):
-        cfg.token_dispatcher.pad_multiple = 256
-        cfg.inner_experts.recipe_name = "mxfp8_floor"
-    with caplog.at_level(logging.WARNING):
-        apply_overrides(config.override, config)
-
-    converter_cfg_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts).Config
-    nodes = _routed_experts_nodes(config)
-    assert nodes
-    for _fqn, cfg, _parent, _attr in nodes:
-        assert type(cfg.inner_experts) is converter_cfg_cls
-
-
-def test_composition_leaves_stock_config_untouched():
-    # No converter ran: the factory sees stock GroupedExperts.Config nodes and
-    # must never claim them.
+def test_composition_fires_on_stock_config():
+    # No converter anywhere: the override alone opts the model in, dispatcher
+    # swap included.
     config = _prepare(deepseek_v3_debugmodel())
     config.override.imports.append(_OVERRIDE_TARGET)
     apply_overrides(config.override, config)
@@ -549,7 +520,95 @@ def test_composition_leaves_stock_config_untouched():
     nodes = _routed_experts_nodes(config)
     assert nodes
     for _fqn, cfg, _parent, _attr in nodes:
-        assert type(cfg.inner_experts) is GroupedExperts.Config
+        assert type(cfg.inner_experts) is MXFP8FusedGroupedExperts.Config
+        assert isinstance(cfg.token_dispatcher, TorchAOTokenDispatcher.Config)
+        assert cfg.token_dispatcher.pad_multiple == 256
+
+
+def test_composition_raises_on_converter_quantized_experts():
+    # The composite quantizes every grouped GEMM itself; layering it on the
+    # MXFP8 grouped-experts converter's output is a config error that must
+    # raise -- never a silent fallback to the converter's unfused path.
+    config = _prepare(deepseek_v3_debugmodel_mxfp8())
+    config.override.imports.append(_OVERRIDE_TARGET)
+    with pytest.raises(ValueError, match="grouped-experts converter"):
+        apply_overrides(config.override, config)
+
+
+def test_composition_raises_on_non_stock_routed_experts_subclass():
+    # A RoutedExperts.Config SUBCLASS must raise, not no-op (the decorator no
+    # longer carries exact=True, so subclass nodes are claimed and gated).
+    @dataclass(kw_only=True)
+    class _DerivedRoutedExpertsConfig(RoutedExperts.Config):
+        pass
+
+    config = _prepare(deepseek_v3_debugmodel())
+    node = _routed_experts_nodes(config)[0][1]
+    with pytest.raises(ValueError, match="stock RoutedExperts"):
+        mxfp8_grouped_experts(derive(node, _DerivedRoutedExpertsConfig))
+
+
+def test_composition_raises_on_unsupported_dims():
+    config = _prepare(deepseek_v3_debugmodel())
+    node = _routed_experts_nodes(config)[0][1]
+    node.inner_experts.hidden_dim = 100  # not a 128-multiple
+    with pytest.raises(ValueError, match="is_supported"):
+        mxfp8_grouped_experts(node)
+
+
+def test_composition_raises_on_non_alltoall_dispatcher():
+    # hybridep's padded dispatcher is not validated for the cuDNN FE 256-row
+    # contract; the factory must refuse it rather than swap or accept it.
+    # HybridEP's own config gate requires EP>1; satisfy it so the factory
+    # refusal (not the dispatcher validation) is what's under test.
+    config = deepseek_v3_debugmodel_hybridep()
+    config.parallelism.expert_parallel_degree = 2
+    _prepare(config)
+    node = _routed_experts_nodes(config)[0][1]
+    with pytest.raises(ValueError, match="TorchAO padded"):
+        mxfp8_grouped_experts(node)
+
+
+def test_composition_raises_when_ops_unavailable(monkeypatch):
+    import torchtitan.overrides.mxfp8_grouped_mlp as override_module
+
+    monkeypatch.setattr(override_module, "_TORCHAO_GROUPED_MLP_OPS_AVAILABLE", False)
+    monkeypatch.setattr(
+        override_module,
+        "_TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON",
+        "unavailable for the test",
+    )
+    config = _prepare(deepseek_v3_debugmodel())
+    node = _routed_experts_nodes(config)[0][1]
+    with pytest.raises(ValueError, match="unavailable for the test"):
+        override_module.mxfp8_grouped_experts(node)
+
+
+def test_16b_ab_arms_share_trainer_knobs_and_dispatcher():
+    # The fused 16b flavor is a standalone config (no grouped converter), so
+    # its A/B pairing with the p256 baseline is hand-maintained; pin the
+    # shared knobs and the post-override dispatcher equivalence.
+    base = deepseek_v3_16b_mxfp8_p256()
+    fused = deepseek_v3_16b_mxfp8_grouped_mlp()
+    assert fused.training.steps == base.training.steps
+    assert fused.training.disable_cuda_graphs == base.training.disable_cuda_graphs
+    assert (
+        fused.parallelism.expert_parallel_degree
+        == base.parallelism.expert_parallel_degree
+    )
+    assert fused.debug.moe_force_load_balance == base.debug.moe_force_load_balance
+    assert fused.hf_assets_path == base.hf_assets_path
+    assert fused.dataloader.dataset == base.dataloader.dataset
+
+    _prepare(fused)
+    apply_overrides(fused.override, fused)
+    base_nodes = _routed_experts_nodes(base)
+    fused_nodes = _routed_experts_nodes(fused)
+    assert len(base_nodes) == len(fused_nodes) > 0
+    for (_bf, b, _bp, _ba), (_ff, fz, _fp, _fa) in zip(base_nodes, fused_nodes):
+        assert type(fz.token_dispatcher) is type(b.token_dispatcher)
+        assert fz.token_dispatcher.pad_multiple == 256
+        assert b.token_dispatcher.pad_multiple == 256
 
 
 # ---------------------------------------------------------------------------

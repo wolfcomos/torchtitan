@@ -31,9 +31,9 @@ allocated row count is a multiple of 256, and every per-expert row count
 corrupt the chain SILENTLY and NONDETERMINISTICALLY (the corruption locus
 migrates between identical-input reruns; no smoke test can prove such a
 configuration safe). The %256 guarantee comes from a ``TorchAOTokenDispatcher``
-with ``pad_multiple=256``, which is why the override targets
-``RoutedExperts.Config`` (the one node owning both the dispatcher and the
-inner experts configs).
+with ``pad_multiple=256``, which the override factory installs itself — hence
+it targets ``RoutedExperts.Config`` (the one node owning both the dispatcher
+and the inner experts configs).
 
 The fused ``w13`` parameter is stored ``[E, 2F, D]`` in the cuDNN 32-block GLU
 row order ``[gate_0..31 | up_0..31 | gate_32..63 | up_32..63 | ...]`` so that
@@ -43,17 +43,15 @@ still save/load the stock ``w1_EFD``/``w3_EFD`` layout through this module's
 state-dict hooks.
 
 Activate with ``--override.imports
-torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts`` on a
-config whose experts were converted by ``MXFP8GroupedExpertsConverter``
-(``pad_multiple=256``, recipe ``mxfp8_rceil``). When any gate fails the
-factory warns with the specific reason and leaves the config unchanged, so
-the run falls back to the converter's unfused MXFP8 path. NOTE: a declined
-run still logs ``[Override] ...`` identity lines and ``Applied N
-override(s)``; the only accepted evidence that the fused path is active is
-the cudnn kernel counts in a profiler trace (count events starting with
-``kernel_cutlass_kernel_`` — the ``kernel_cutlass_helper_kernel_*`` companion
-launches contain the same name fragments and would double a bare substring
-count).
+torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts`` on a STOCK
+``RoutedExperts.Config``: the override is self-contained. Its factory swaps
+the token dispatcher for the padded TorchAO variant itself and needs no
+quantization converter (the composite quantizes every grouped GEMM). There
+is no silent fallback: configurations the kernels cannot execute (missing
+torchao ops, non-SM100 hardware, converter-quantized or otherwise non-stock
+experts, dims violating the 128-alignment contract) raise an actionable
+error at config-application time rather than training the unfused path
+silently.
 """
 
 from dataclasses import dataclass
@@ -67,8 +65,8 @@ from torchao.prototype.moe_training.kernels.mxfp8 import (
 
 # Importing the wrapper module registers the four torchao:: custom ops; the
 # cudnn package is only imported lazily inside the op bodies at first launch.
-# The module is newer than several torchao releases, so its absence must be a
-# graceful factory decline (fallback to the converter's unfused MXFP8 path),
+# The module is newer than several torchao releases, so its absence must
+# surface as the factory's actionable config-time error (with this reason),
 # not an ImportError at override-import time. Tests skip on this flag too.
 try:
     from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_grouped_mlp import (
@@ -105,12 +103,14 @@ from torchao.prototype.mx_formats.utils import (
 )
 from torchao.quantization.quantize_.common import KernelPreference
 
-from torchtitan.components.quantization.mx import _get_mxfp8_grouped_experts_cls
+from torchtitan.components.quantization.utils import swap_token_dispatcher
 from torchtitan.config import derive, override
 from torchtitan.models.common.moe import GroupedExperts, RoutedExperts
-from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
+from torchtitan.models.common.token_dispatcher import (
+    AllToAllTokenDispatcher,
+    TorchAOTokenDispatcher,
+)
 from torchtitan.overrides.fused_swiglu import _fuse_w13_grouped_experts_sharding
-from torchtitan.tools.logging import logger
 
 __all__ = [
     "MXFP8FusedGroupedExperts",
@@ -379,21 +379,24 @@ def _make_w13_init(gate_init, up_init):
     """Initializer for the 32-block-ordered ``w13 [E, 2F, D]`` from the stock
     per-half initializers.
 
-    The stock initializers run on stock-shaped ``(E, F, D)`` contiguous
-    temporaries — NOT on strided 32-block sub-views of ``w13`` — so
-    fan-computing initializers (e.g. ``nn.init.xavier_uniform_``) see exactly
-    the geometry the unfused module hands them; the results are then remapped
-    into the 32-block row order."""
+    Each half is initialized IN PLACE through a strided sub-view of ``w13``
+    (the same ``(E, F/32, 2, 32, D)`` view the save hook uses), mirroring
+    ``_make_fused_gate_up_init``: initializing the parameter itself keeps
+    DTensor init semantics under parallelism — shard-distinct, globally
+    consistent draws through the DTensor RNG tracker. (Plain-tensor
+    temporaries would draw IDENTICAL values on every rank — torchtitan
+    seeds all non-PP ranks the same — silently duplicating experts across
+    EP/FSDP shards; and a plain ``copy_`` into a DTensor raises.) The cost:
+    fan-computing initializers (e.g. ``nn.init.xavier_uniform_``) would see
+    the blocked 4-D sub-view geometry instead of stock ``(E, F, D)``; every
+    in-tree ``w1_EFD``/``w3_EFD`` initializer is a fixed-std
+    ``trunc_normal_``, which is shape-agnostic."""
 
     def _init(t: torch.Tensor) -> None:
         e, two_f, d = t.shape
-        f = two_f // 2
-        w1 = torch.empty(e, f, d, dtype=t.dtype, device=t.device)
-        w3 = torch.empty_like(w1)
-        gate_init(w1)  # gate (stock w1) half
-        up_init(w3)  # up (stock w3) half
-        with torch.no_grad():
-            t.copy_(_stock_pair_to_w13(w1, w3))
+        v = t.view(e, two_f // 64, 2, 32, d)
+        gate_init(v[:, :, 0])  # gate (stock w1) half
+        up_init(v[:, :, 1])  # up (stock w3) half
 
     return _init
 
@@ -427,7 +430,7 @@ class MXFP8FusedGroupedExperts(GroupedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
         # No new fields in v1. derive() carries param_init / sharding_config /
-        # dim / hidden_dim / num_experts from the converter's config by name;
+        # dim / hidden_dim / num_experts from the stock config by name;
         # any future knob must be re-declared here or derive() drops it.
         pass
 
@@ -508,80 +511,82 @@ class MXFP8FusedGroupedExperts(GroupedExperts):
             )
 
 
-def _decline(reason: str) -> None:
-    logger.warning(f"mxfp8_grouped_experts override NOT applied: {reason}")
-
-
 @override(
     target=RoutedExperts.Config,
-    exact=True,
     description="cuDNN-frontend fused MXFP8 grouped-MLP for routed experts.",
 )
 def mxfp8_grouped_experts(cfg: RoutedExperts.Config) -> RoutedExperts.Config:
-    """Swap converter-produced MXFP8 inner experts for the cudnn-FE composite.
+    """Swap stock grouped experts for the cudnn-FE fused MXFP8 composite.
 
-    Targets ``RoutedExperts.Config`` because it owns BOTH the
-    ``token_dispatcher`` and ``inner_experts`` children — the only static
-    place the ABI's ``m[g] % 256`` guarantee (dispatcher ``pad_multiple``) is
-    checkable. Fires only when every gate passes; otherwise warns with the
-    failed gate and returns ``cfg`` unchanged (fallback = the converter's
-    unfused MXFP8 path).
+    Targets ``RoutedExperts.Config`` because the composite constrains BOTH
+    children: the ``inner_experts`` (replaced with the fused module) and the
+    ``token_dispatcher``, which the factory swaps for the padded TorchAO
+    variant that guarantees the ABI's ``m[g] % 256``. Self-contained and
+    fail-loud: no converter is involved, and any configuration the kernels
+    cannot execute raises at config-application time instead of silently
+    training the unfused path.
     """
-    experts = cfg.inner_experts
-    dispatcher = cfg.token_dispatcher
-
-    if not isinstance(dispatcher, TorchAOTokenDispatcher.Config):
-        _decline(
-            f"token_dispatcher is {type(dispatcher).__qualname__}, not a "
-            "TorchAOTokenDispatcher.Config (no per-expert 256-row padding)."
-        )
-        return cfg
-    if dispatcher.pad_multiple != _ROW_ALIGNMENT:
-        _decline(
-            f"token_dispatcher.pad_multiple is {dispatcher.pad_multiple}; the "
-            f"cuDNN FE kernels require per-expert groups padded to "
-            f"{_ROW_ALIGNMENT} (FIX_PAD_SIZE) — 128-multiple-only splits "
-            "corrupt silently and nondeterministically."
-        )
-        return cfg
-    if type(experts) is not _get_mxfp8_grouped_experts_cls(GroupedExperts).Config:
-        _decline(
-            f"inner_experts is {type(experts).__qualname__}, not the "
-            "MXFP8GroupedExpertsConverter-produced MXFP8GroupedExperts.Config."
-        )
-        return cfg
-    if experts.recipe_name != "mxfp8_rceil":
-        _decline(
-            f"inner_experts.recipe_name is '{experts.recipe_name}'; only "
-            "'mxfp8_rceil' is supported."
-        )
-        return cfg
-    if not _TORCHAO_GROUPED_MLP_OPS_AVAILABLE:
-        _decline(_TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON)
-        return cfg
     if not (
         torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
     ):
-        _decline("requires CUDA device capability exactly (10, 0).")
-        return cfg
+        raise ValueError(
+            "mxfp8_grouped_experts requires CUDA device capability exactly "
+            "(10, 0) (the torchao ops wrap cudnn grouped_gemm_*_wrapper_sm100 "
+            "kernels); remove the override or run on supported hardware."
+        )
+    if not _TORCHAO_GROUPED_MLP_OPS_AVAILABLE:
+        raise ValueError(
+            f"mxfp8_grouped_experts: {_TORCHAO_GROUPED_MLP_UNAVAILABLE_REASON}"
+        )
+    if type(cfg) is not RoutedExperts.Config:
+        raise ValueError(
+            "mxfp8_grouped_experts targets the stock RoutedExperts.Config, "
+            f"got {type(cfg).__qualname__}; narrow this override's fqns or "
+            "remove the conflicting override."
+        )
+    experts = cfg.inner_experts
+    if type(experts) is not GroupedExperts.Config:
+        raise ValueError(
+            "mxfp8_grouped_experts requires the stock GroupedExperts.Config, "
+            f"but inner_experts is {type(experts).__qualname__}. The "
+            "composite quantizes every grouped GEMM itself — do not combine "
+            "it with the MXFP8 grouped-experts converter."
+        )
     # GLOBAL dims only: the config carries sharding placements (e.g. the TP
     # Shard(1) on hidden_dim) but not mesh degrees, so the per-rank shard dims
     # cannot be computed here. MXFP8FusedGroupedExperts.forward re-validates
     # the LOCAL dims at first call and raises with the config fix.
     if not is_supported(experts.dim, experts.hidden_dim):
-        _decline(
-            f"is_supported(D={experts.dim}, F={experts.hidden_dim}) is False; "
-            f"both dims must be positive multiples of {_DIM_ALIGNMENT}."
+        raise ValueError(
+            f"mxfp8_grouped_experts: is_supported(D={experts.dim}, "
+            f"F={experts.hidden_dim}) is False; both dims must be positive "
+            f"multiples of {_DIM_ALIGNMENT}."
         )
-        return cfg
+
+    # The %256 padding contract is the factory's own work (no converter
+    # involved): the cuDNN FE kernels require per-expert groups padded to
+    # 256 (FIX_PAD_SIZE) — 128-multiple-only splits corrupt silently and
+    # nondeterministically.
+    dispatcher = cfg.token_dispatcher
+    if isinstance(dispatcher, TorchAOTokenDispatcher.Config):
+        dispatcher.pad_multiple = _ROW_ALIGNMENT
+    elif isinstance(dispatcher, AllToAllTokenDispatcher.Config):
+        swap_token_dispatcher(cfg, pad_multiple=_ROW_ALIGNMENT)
+    else:
+        raise ValueError(
+            f"mxfp8_grouped_experts: token_dispatcher is "
+            f"{type(dispatcher).__qualname__}; only the TorchAO padded "
+            "dispatcher (swapped in from the stock all-to-all) is validated "
+            "for the per-expert 256-row contract."
+        )
 
     fused = derive(experts, MXFP8FusedGroupedExperts.Config)
     # The w1_EFD/w3_EFD -> w13 param-init remap is factory work (it is not
     # inherited through derive()); the sharding remap simply carries w1's
-    # layout onto w13 (both rank-3, same shard axes), never a decline:
-    # deepseek EP=1 configs carry TP Shard(1) on w1_EFD unconditionally, so a
-    # fused-dim-Shard decline would silently disable the override in exactly
-    # the single-GPU debug mode.
+    # layout onto w13 (both rank-3, same shard axes), never a gate:
+    # deepseek EP=1 configs carry TP Shard(1) on w1_EFD unconditionally, so
+    # raising on a fused-dim Shard would reject exactly the single-GPU debug
+    # mode.
     fused.param_init = _w13_grouped_experts_param_init(fused.param_init)
     if fused.sharding_config is not None:
         fused.sharding_config = _fuse_w13_grouped_experts_sharding(

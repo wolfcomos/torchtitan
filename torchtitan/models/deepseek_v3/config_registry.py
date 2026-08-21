@@ -133,16 +133,30 @@ def deepseek_v3_debugmodel_mxfp8_p256() -> Trainer.Config:
 
 
 def deepseek_v3_debugmodel_mxfp8_grouped_mlp() -> Trainer.Config:
-    # deepseek_v3_debugmodel_mxfp8_p256 plus the fused grouped-MLP override:
-    # it swaps the converter-produced MXFP8 inner experts for the
-    # cudnn-frontend fused composite
-    # (torchtitan/overrides/mxfp8_grouped_mlp.py) when its gates pass; the
-    # converter keeps the dense MXFP8Linear swap and the pad_multiple=256
-    # token dispatcher. disable_cuda_graphs is required by the
-    # TorchAOTokenDispatcher under EP>1; moe_force_load_balance keeps the
-    # per-rank routed row count fixed (a constant R avoids cudnn FE JIT
-    # churn per newly seen R).
-    config = deepseek_v3_debugmodel_mxfp8_p256()
+    # Fused arm of the deepseek_v3_debugmodel_mxfp8_p256 A/B pair. The
+    # self-contained mxfp8_grouped_experts override
+    # (torchtitan/overrides/mxfp8_grouped_mlp.py) owns the whole routed-expert
+    # path — the cudnn-frontend fused composite plus the pad_multiple=256
+    # TorchAO dispatcher its factory installs — so no grouped-experts
+    # converter runs here; only the dense MXFP8Linear swap, keeping the
+    # non-expert layers identical to the baseline arm (checkpoints stay
+    # interchangeable through the override's stock-layout state-dict hooks).
+    # disable_cuda_graphs is required by the TorchAOTokenDispatcher under
+    # EP>1; moe_force_load_balance keeps the per-rank routed row count fixed
+    # (a constant R avoids cudnn FE JIT churn per newly seen R).
+    config = deepseek_v3_debugmodel()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "shared_experts", "feed_forward"],
+            ),
+        ],
+    )
     config.override.imports.append(
         "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
     )
@@ -286,9 +300,9 @@ def deepseek_v3_16b_mxfp8() -> Trainer.Config:
 def deepseek_v3_16b_mxfp8_p256() -> Trainer.Config:
     # deepseek_v3_16b_mxfp8 with the dispatcher padded to 256 — the
     # pad_multiple required by the fused cudnn grouped-MLP kernels (cuDNN FE
-    # FIX_PAD_SIZE). Still runs the unfused MXFP8 experts; the fused variant
-    # below differs only in the override import, so the two share an
-    # identical dispatcher config.
+    # FIX_PAD_SIZE). Still runs the unfused MXFP8 experts; the fused
+    # counterpart deepseek_v3_16b_mxfp8_grouped_mlp installs an identical
+    # dispatcher config through its override factory.
     config = deepseek_v3_16b_mxfp8()
     _set_routed_experts_pad_multiple(config, 256)
     return config
@@ -297,9 +311,10 @@ def deepseek_v3_16b_mxfp8_p256() -> Trainer.Config:
 def deepseek_v3_16b_mxfp8_p256_wgrad_hp() -> Trainer.Config:
     # High-precision-wgrad variant: routed-expert weight gradients in
     # BF16 grouped GEMMs, everything else (fwd/dgrad, dense linears) stays
-    # MXFP8. The fused grouped-MLP override does not support this recipe and
-    # would decline it. model_registry applies converters eagerly, so the
-    # recipe is retargeted on the already-converted experts configs, like
+    # MXFP8. The fused grouped-MLP override has no HP-wgrad mode (and cannot
+    # be combined with converter-quantized experts — its factory raises).
+    # model_registry applies converters eagerly, so the recipe is retargeted
+    # on the already-converted experts configs, like
     # _set_routed_experts_pad_multiple.
     config = deepseek_v3_16b_mxfp8_p256()
     nodes = list(config.traverse(RoutedExperts.Config))
@@ -310,9 +325,33 @@ def deepseek_v3_16b_mxfp8_p256_wgrad_hp() -> Trainer.Config:
 
 
 def deepseek_v3_16b_mxfp8_grouped_mlp() -> Trainer.Config:
-    # deepseek_v3_16b_mxfp8_p256 plus the fused grouped-MLP override;
-    # differs ONLY in the override import.
-    config = deepseek_v3_16b_mxfp8_p256()
+    # Fused arm of the deepseek_v3_16b_mxfp8_p256 A/B pair: same trainer
+    # settings and dense MXFP8Linear converter, but the routed-expert path is
+    # owned entirely by the self-contained mxfp8_grouped_experts override
+    # (cudnn-frontend fused composite + the pad_multiple=256 TorchAO
+    # dispatcher its factory installs) instead of the grouped-experts
+    # converter. Checkpoints stay interchangeable through the override's
+    # stock-layout state-dict hooks.
+    config = deepseek_v3_16b()
+    config.hf_assets_path = "./tests/assets/tokenizer"
+    config.dataloader = HuggingFaceTextDataLoader.Config(dataset="c4_test")
+    config.training.steps = 50
+    config.training.disable_cuda_graphs = True
+    config.parallelism.expert_parallel_degree = 4
+    config.debug.moe_force_load_balance = True
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "shared_experts", "feed_forward"],
+            ),
+        ],
+    )
     config.override.imports.append(
         "torchtitan.overrides.mxfp8_grouped_mlp.mxfp8_grouped_experts"
     )
