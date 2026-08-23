@@ -317,3 +317,138 @@ class NVFP4LinearConverter(QuantizationConverter):
 
         logger.info("Converted Linear layers to NVFP4Linear")
         return model_config
+
+
+try:
+    from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
+        four_over_six_linear,
+        four_over_six_mm,
+    )
+
+    # Like nvfp4_mm_triton above: an opaque local autograd function, marked
+    # local-safe so SPMD type checking propagates through it.
+    spmd.register_local_autograd_function(four_over_six_mm)
+
+    class NVFP4FourOverSixLinear(Linear):
+        """Linear with NVFP4 four-over-six quantized GEMMs.
+
+        Four-over-six encodes every FP4 block twice (the standard map-to-6
+        scale and a 1.5x-expanded map-to-4 scale) and stores the candidate
+        with the lower dequantization error. Forward GEMM operands are
+        four-over-six (activations 1x16, optionally row-scaled; weights
+        16x16); gradients use standard NVFP4, or bf16 GEMMs when
+        ``row_scaled_activation`` is set (a row-scaled four-over-six tensor
+        has no columnwise form for the wgrad operand). No RHT and no
+        stochastic rounding: the recipe targets RL and post-training.
+        Pure leaf swap like :class:`MXFP8Linear`; TP is not wired up.
+        """
+
+        @dataclass(kw_only=True, slots=True)
+        class Config(Linear.Config):
+            """Drop-in replacement for Linear.Config that builds
+            NVFP4FourOverSixLinear."""
+
+            err_mode: str = "mae"
+            """Candidate-selection error metric, 'mae' or 'mse'."""
+
+            e4m3_scale_bound: int = 256
+            """Global E4M3 scale bound; 256 leaves map-to-4 headroom."""
+
+            row_scaled_activation: bool = False
+            """One FP32 global scale per activation row instead of per
+            tensor. Selects the bf16 backward."""
+
+            def __post_init__(self) -> None:
+                for name in ("in_features", "out_features"):
+                    value = getattr(self, name)
+                    if value % _NVFP4_BLOCK:
+                        raise ValueError(
+                            f"NVFP4 requires {name} divisible by {_NVFP4_BLOCK}; "
+                            f"got {name}={value}. NVFP4 cannot quantize this Linear; "
+                            "exclude it from the converter fqns."
+                        )
+
+        def __init__(self, config: Config):
+            Linear.__init__(self, config)
+            self.err_mode = config.err_mode
+            self.e4m3_scale_bound = config.e4m3_scale_bound
+            self.row_scaled_activation = config.row_scaled_activation
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return four_over_six_linear(
+                x,
+                self.weight,
+                self.bias,
+                self.err_mode,
+                self.e4m3_scale_bound,
+                self.row_scaled_activation,
+            )
+
+except ImportError:
+    NVFP4FourOverSixLinear = None
+
+
+class NVFP4FourOverSixLinearConverter(QuantizationConverter):
+    """Replace matching Linear.Config with NVFP4FourOverSixLinear.Config."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(QuantizationConverter.Config):
+        fqns: list[str] = field(default_factory=list)
+        """
+        List of fully qualified names of modules to apply four-over-six NVFP4
+        quantization to. Only Linear.Config entries whose FQN contains a match
+        are converted. If empty, all Linear modules are converted -- pass
+        explicit fqns to keep the LM head in bf16.
+        """
+
+        err_mode: str = "mae"
+        """Candidate-selection error metric, 'mae' or 'mse'."""
+
+        e4m3_scale_bound: int = 256
+        """Global E4M3 scale bound; 256 leaves map-to-4 headroom."""
+
+        row_scaled_activation: bool = False
+        """One FP32 global scale per activation row instead of per tensor."""
+
+    def __init__(self, config: Config):
+        self.config = config
+
+        if NVFP4FourOverSixLinear is None:
+            raise ImportError(
+                "torchao is not installed or does not provide the NVFP4 "
+                "four-over-six training prototype. Install a torchao build "
+                "with torchao.prototype.moe_training.nvfp4_training."
+            )
+
+        if not has_cuda_capability(10, 0):
+            raise ValueError("NVFP4 is only supported on SM100 or later architectures")
+
+        if not self.config.model_compile_enabled:
+            logger.warning(
+                "torch.compile enablement is required for highest performance "
+                "of NVFP4 dynamic quantization."
+            )
+
+    def convert(self, model_config):
+        assert NVFP4FourOverSixLinear is not None
+        fqns = self.config.fqns
+        for fqn, config, parent, attr in model_config.traverse(Linear.Config):
+            if not fqns or any(target_fqn in fqn for target_fqn in fqns):
+                new_config = NVFP4FourOverSixLinear.Config(
+                    in_features=config.in_features,
+                    out_features=config.out_features,
+                    bias=config.bias,
+                    param_init=config.param_init,
+                    err_mode=self.config.err_mode,
+                    e4m3_scale_bound=self.config.e4m3_scale_bound,
+                    row_scaled_activation=self.config.row_scaled_activation,
+                )
+                if parent is None:
+                    model_config = new_config
+                elif isinstance(parent, list):
+                    parent[attr] = new_config
+                else:
+                    setattr(parent, attr, new_config)
+
+        logger.info("Converted Linear layers to NVFP4FourOverSixLinear")
+        return model_config
