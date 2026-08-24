@@ -615,13 +615,23 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
             # The hook receives B_t pre-transposed to (E, K, N); the torchao op
             # takes expert weights in their stored (E, N, K) layout (it makes
             # the operands contiguous itself).
-            return four_over_six_grouped_mm(
-                A,
+            #
+            # The swapped TorchAOTokenDispatcher already 128-aligns every
+            # expert group but over-allocates the activation buffer past
+            # offs[-1], while the torchao op requires offs[-1] == A.shape[0]
+            # and the unwritten tail rows must not feed the per-group amaxes.
+            # Slice to the logical rows, skip the op's own padding, and
+            # zero-extend the output (pad routes zero grads to the tail;
+            # the unpermute never reads tail rows).
+            m_total = int(offs[-1])
+            out = four_over_six_grouped_mm(
+                A[:m_total],
                 B_t.transpose(-2, -1),
                 offs,
-                pad_token_groups_for_grouped_mm=True,
+                pad_token_groups_for_grouped_mm=False,
                 **self._four_over_six_kwargs,
             )
+            return torch.nn.functional.pad(out, (0, 0, 0, A.shape[0] - m_total))
 
     FourOverSixGroupedExperts.__name__ = f"NVFP4FourOverSix{parent_cls.__name__}"
     FourOverSixGroupedExperts.__qualname__ = f"NVFP4FourOverSix{parent_cls.__name__}"
