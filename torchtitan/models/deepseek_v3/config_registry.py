@@ -122,6 +122,11 @@ def _deepseek_v3_debugmodel_nvfp4_four_over_six(
     # gate, embeddings, and the lm_head all stay bf16 -- the recipe's
     # experts-only allow-list.
     config = deepseek_v3_debugmodel()
+    # The quantized grouped GEMM reads the expert group offsets on the host
+    # (and the row-scaled path loops dense GEMMs per group), which CUDA-graph
+    # capture forbids; miles likewise runs its quantized recipes with CUDA
+    # graphs off.
+    config.training.disable_cuda_graphs = True
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
