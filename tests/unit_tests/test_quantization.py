@@ -640,3 +640,65 @@ def test_nvfp4_four_over_six_linear_converter_plumbs_new_knobs(monkeypatch):
     assert converted
     assert all(lc.backward_override == "dequantized" for lc in converted)
     assert all(lc.weight_block == "1x16" for lc in converted)
+
+
+def test_four_over_six_grouped_converter_rejects_compile_with_row_scaled(monkeypatch):
+    _four_over_six_grouped_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import (
+        NVFP4FourOverSixGroupedExpertsConverter,
+    )
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # The row-scaled grouped forward host-reads offsets and loops per group,
+    # which fullgraph compile cannot capture -> rejected at config time.
+    with pytest.raises(ValueError, match="torch.compile"):
+        NVFP4FourOverSixGroupedExpertsConverter(
+            NVFP4FourOverSixGroupedExpertsConverter.Config(
+                model_compile_enabled=True,
+                row_scaled_activation=True,
+            )
+        )
+    # Either knob alone stays accepted.
+    NVFP4FourOverSixGroupedExpertsConverter(
+        NVFP4FourOverSixGroupedExpertsConverter.Config(
+            model_compile_enabled=True,
+        )
+    )
+    NVFP4FourOverSixGroupedExpertsConverter(
+        NVFP4FourOverSixGroupedExpertsConverter.Config(
+            row_scaled_activation=True,
+        )
+    )
+
+
+def test_has_quantization_counts_four_over_six(monkeypatch):
+    _four_over_six_grouped_cls()
+    from torchtitan.components.quantization import (
+        NVFP4FourOverSixLinear,
+        NVFP4FourOverSixLinearConverter,
+    )
+
+    if NVFP4FourOverSixLinear is None:
+        pytest.skip("torchao NVFP4 four-over-six training prototype not available")
+
+    stock = ConfigManager().parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel"]
+    )
+    assert not has_quantization(stock.model_spec.model)
+
+    grouped = _parse_recipe(
+        monkeypatch, "deepseek_v3", "deepseek_v3_debugmodel_nvfp4_four_over_six"
+    )
+    assert has_quantization(grouped)
+
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    dense = ConfigManager().parse_args(
+        ["--module", "llama3", "--config", "llama3_debugmodel"]
+    )
+    converter = NVFP4FourOverSixLinearConverter(
+        NVFP4FourOverSixLinearConverter.Config(fqns=["layers"])
+    )
+    assert has_quantization(converter.convert(dense.model_spec.model))
