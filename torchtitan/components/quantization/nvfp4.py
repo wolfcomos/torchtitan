@@ -646,6 +646,11 @@ class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
     with no Linear converter alongside, this converter alone reproduces that
     allow-list (attention, dense MLP, shared experts, router, embeddings, and
     the LM head all stay bf16).
+
+    The row-scaled grouped forward loops dense GEMMs per token group with
+    host-read offsets, so it cannot be captured by torch.compile; combining
+    row_scaled_activation with model compile is rejected at config time (a
+    fused single-GEMM row-scaled variant is future work).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -693,6 +698,14 @@ class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
 
         if not has_cuda_capability(10, 0):
             raise ValueError("NVFP4 is only supported on SM100 or later architectures")
+
+        if self.config.model_compile_enabled and self.config.row_scaled_activation:
+            raise ValueError(
+                "row-scaled four-over-six grouped GEMMs loop dense GEMMs per "
+                "token group with host-read offsets and cannot be captured by "
+                "torch.compile; run this converter eager (a fused single-GEMM "
+                "row-scaled variant is future work)."
+            )
 
         if not self.config.model_compile_enabled:
             logger.warning(
