@@ -16,6 +16,7 @@ import dataclasses
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
+from torchtitan.components.quantization import NVFP4FourOverSixGroupedExpertsConverter
 from torchtitan.config import (
     CompileConfig,
     DebugConfig,
@@ -786,6 +787,37 @@ def rl_grpo_qwen3_30b_a3b_varlen() -> Controller.Config:
             ),
         ),
     )
+
+
+def rl_grpo_qwen3_30b_a3b_varlen_nvfp4_four_over_six() -> Controller.Config:
+    """Qwen3-30B-A3B GRPO with four-over-six NVFP4 routed experts.
+
+    The torchtitan analog of the miles NVFP4 RL reference recipe (which trains
+    the same model): only the routed-expert grouped GEMMs quantize, with
+    row-scaled activations, MSE candidate selection, E4M3 bound 256, 1x16
+    weight blocks, and the high-precision backward. Because the trainer and
+    the vLLM generator share this one model_spec, both actors run the
+    identical four-over-six forward -- the policy trains on the same quantized
+    function the generator samples from, which is the recipe's
+    train/inference-consistency point (no quantized-weight sync needed; the
+    bf16 master weights sync as usual and each side re-quantizes dynamically).
+    """
+    config = rl_grpo_qwen3_30b_a3b_varlen()
+    config.model_spec = model_registry(
+        "30B-A3B",
+        attn_backend="varlen",
+        converters=[
+            NVFP4FourOverSixGroupedExpertsConverter.Config(
+                row_scaled_activation=True,
+                err_mode="mse",
+                e4m3_scale_bound=256,
+                weight_block="1x16",
+                backward_override="high_precision",
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
 
 
 def rl_grpo_qwen3_30b_a3b_varlen_perf() -> Controller.Config:

@@ -14,7 +14,9 @@ from torchtitan.components.quantization import (
     Float8LinearConverter,
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
+    NVFP4FourOverSixGroupedExpertsConverter,
 )
+from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_first_last_fqns
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import DATASETS
@@ -107,6 +109,57 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
         ],
     )
     return config
+
+
+def _deepseek_v3_debugmodel_nvfp4_four_over_six(
+    backward_override: str, fqns: list[str] | None = None
+) -> Trainer.Config:
+    # Quantize only the routed-expert grouped GEMMs with four-over-six NVFP4,
+    # mirroring the miles NVFP4 RL recipes: row-scaled activations, MSE
+    # candidate selection, E4M3 bound 256, and 1x16 weight blocks
+    # (NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1). With no Linear converter,
+    # attention, the dense-layer feed-forward, shared experts, the MoE router
+    # gate, embeddings, and the lm_head all stay bf16 -- the recipe's
+    # experts-only allow-list.
+    config = deepseek_v3_debugmodel()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            NVFP4FourOverSixGroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=fqns or [],
+                row_scaled_activation=True,
+                err_mode="mse",
+                e4m3_scale_bound=256,
+                weight_block="1x16",
+                backward_override=backward_override,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
+def deepseek_v3_debugmodel_nvfp4_four_over_six() -> Trainer.Config:
+    # The miles NVFP4 RL base recipe point: high-precision backward
+    # (NVTE_BACKWARD_OVERRIDE=high_precision) on every routed-expert layer.
+    return _deepseek_v3_debugmodel_nvfp4_four_over_six("high_precision")
+
+
+def deepseek_v3_debugmodel_nvfp4_four_over_six_dequantized() -> Trainer.Config:
+    # The advanced miles recipe variant (the GLM-5.2 NVFP4 e2e analog): the
+    # dequantized backward (NVTE_BACKWARD_OVERRIDE=dequantized) backpropagates
+    # through bf16 GEMMs on the dequantized fprop operands, and the first and
+    # last decoder layers stay bf16 (--first-last-layers-bf16 with one layer
+    # at each end). The debugmodel's layer 0 is dense (no routed experts), so
+    # the leading-layer exclusion is vacuous there but keeps the recipe shape.
+    # The debugmodel has 6 layers; layers 1..4 quantize.
+    return _deepseek_v3_debugmodel_nvfp4_four_over_six(
+        "dequantized", fqns=nvfp4_bf16_first_last_fqns(6, 1, 1)
+    )
 
 
 def deepseek_v3_debugmodel_hybridep() -> Trainer.Config:
