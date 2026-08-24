@@ -124,6 +124,29 @@ def deepseek_v3_debugmodel_mxfp8_fused_mlp() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_debugmodel_mxfp8_grouped_gemm_mlp() -> Trainer.Config:
+    config = deepseek_v3_debugmodel()
+    # Routed experts via the MXFP8 fused-MLP override's fully-fused plan
+    # (fusion_plan="grouped_gemm_swiglu"): one composite of four fused
+    # torchao grouped-GEMM ops owns the whole routed-expert path, and the
+    # factory installs the pad_multiple=256 TorchAO dispatcher those kernels
+    # require, produced by the EP permute path, hence
+    # expert_parallel_degree=2. disable_cuda_graphs is required by the
+    # TorchAOTokenDispatcher under EP>1; moe_force_load_balance keeps the
+    # per-rank routed row count fixed (a constant R avoids fused-kernel JIT
+    # churn per newly seen R).
+    config.override.imports.append(
+        (
+            "torchtitan.overrides.mxfp8_fused_mlp.mxfp8_fused_grouped_mlp",
+            {"fusion_plan": "grouped_gemm_swiglu"},
+        )
+    )
+    config.parallelism = ParallelismConfig(expert_parallel_degree=2)
+    config.training.disable_cuda_graphs = True
+    config.debug.moe_force_load_balance = True
+    return config
+
+
 def deepseek_v3_debugmodel_hybridep() -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     config.model_spec = model_registry(
