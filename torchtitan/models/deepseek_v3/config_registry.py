@@ -7,7 +7,7 @@
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
+from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.quantization import (
     Float8GroupedExpertsConverter,
     Float8LinearConverter,
