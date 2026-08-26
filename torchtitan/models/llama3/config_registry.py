@@ -20,6 +20,7 @@ from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.quantization import (
     Float8LinearConverter,
     MXFP8LinearConverter,
+    NVFP4FourOverSixLinearConverter,
     NVFP4LinearConverter,
 )
 from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
@@ -130,6 +131,27 @@ def llama3_debugmodel_nvfp4() -> Trainer.Config:
         "debugmodel",
         converters=[
             NVFP4LinearConverter.Config(
+                fqns=["layers"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_debugmodel_nvfp4_four_over_six() -> Trainer.Config:
+    config = llama3_debugmodel()
+    config.parallelism.spmd_backend = "spmd_types"
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    # fqns=["layers"] converts every in-layer Linear (attention + feed_forward)
+    # while leaving the lm_head stock: NVFP4 requires each GEMM dim divisible by
+    # 128, which the vocab projection does not satisfy.
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            NVFP4FourOverSixLinearConverter.Config(
                 fqns=["layers"],
                 model_compile_enabled=model_compile_enabled,
             ),

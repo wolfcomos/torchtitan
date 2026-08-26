@@ -71,7 +71,11 @@ def has_quantization(model_config) -> bool:
         Float8Linear,
     )
     from torchtitan.components.quantization.mx import _mxfp8_experts_cache, MXFP8Linear
-    from torchtitan.components.quantization.nvfp4 import NVFP4Linear
+    from torchtitan.components.quantization.nvfp4 import (
+        _four_over_six_experts_cache,
+        NVFP4FourOverSixLinear,
+        NVFP4Linear,
+    )
 
     quant_linear_types: list[type] = []
     if Float8Linear is not None:
@@ -80,6 +84,8 @@ def has_quantization(model_config) -> bool:
         quant_linear_types.append(MXFP8Linear.Config)
     if NVFP4Linear is not None:
         quant_linear_types.append(NVFP4Linear.Config)
+    if NVFP4FourOverSixLinear is not None:
+        quant_linear_types.append(NVFP4FourOverSixLinear.Config)
 
     has_quant_linear = bool(quant_linear_types) and any(
         isinstance(config, tuple(quant_linear_types))
@@ -87,7 +93,11 @@ def has_quantization(model_config) -> bool:
     )
     quant_experts_types = tuple(
         cls.Config  # type: ignore[attr-defined]
-        for cls in (*_float8_experts_cache.values(), *_mxfp8_experts_cache.values())
+        for cls in (
+            *_float8_experts_cache.values(),
+            *_mxfp8_experts_cache.values(),
+            *_four_over_six_experts_cache.values(),
+        )
     )
     has_quant_moe = bool(quant_experts_types) and any(
         isinstance(config, quant_experts_types)
