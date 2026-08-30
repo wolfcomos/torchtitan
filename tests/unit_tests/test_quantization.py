@@ -641,7 +641,7 @@ def test_nvfp4_four_over_six_linear_converter_plumbs_new_knobs(monkeypatch):
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
     from torchtitan.components.quantization import (
         NVFP4FourOverSixLinear,
-        NVFP4FourOverSixLinearConverter,
+        NVFP4LinearConverter,
     )
 
     if NVFP4FourOverSixLinear is None:
@@ -651,9 +651,10 @@ def test_nvfp4_four_over_six_linear_converter_plumbs_new_knobs(monkeypatch):
     config = ConfigManager().parse_args(
         ["--module", "llama3", "--config", "llama3_debugmodel"]
     )
-    converter = NVFP4FourOverSixLinearConverter(
-        NVFP4FourOverSixLinearConverter.Config(
+    converter = NVFP4LinearConverter(
+        NVFP4LinearConverter.Config(
             fqns=["layers"],
+            recipe="four_over_six",
             backward_override="dequantized",
             weight_block="1x16",
         )
@@ -670,31 +671,58 @@ def test_nvfp4_four_over_six_linear_converter_plumbs_new_knobs(monkeypatch):
     assert all(lc.weight_block == "1x16" for lc in converted)
 
 
+def test_nvfp4_converter_rejects_unknown_recipe(monkeypatch):
+    _nvfp4_linear_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4LinearConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    with pytest.raises(ValueError, match="Unknown NVFP4 recipe"):
+        NVFP4LinearConverter(NVFP4LinearConverter.Config(recipe="rht"))
+
+
+def test_nvfp4_converter_default_recipe_rejects_four_over_six_knobs(monkeypatch):
+    _nvfp4_linear_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4LinearConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # The four-over-six knobs are meaningless under torchao's stock recipe, so
+    # a non-default value is rejected rather than silently ignored.
+    with pytest.raises(ValueError, match="only apply to recipe='four_over_six'"):
+        NVFP4LinearConverter(NVFP4LinearConverter.Config(weight_block="1x16"))
+    # The one error names every offending knob.
+    with pytest.raises(ValueError, match="err_mode, row_scaled_activation"):
+        NVFP4LinearConverter(
+            NVFP4LinearConverter.Config(err_mode="mse", row_scaled_activation=True)
+        )
+    # Knobs left at their defaults stay accepted under recipe='default'.
+    NVFP4LinearConverter(NVFP4LinearConverter.Config(err_mode="mae"))
+
+
 def test_four_over_six_grouped_converter_rejects_compile_with_row_scaled(monkeypatch):
     _four_over_six_grouped_cls()
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
-    from torchtitan.components.quantization import (
-        NVFP4FourOverSixGroupedExpertsConverter,
-    )
+    from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
 
     monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
     # The row-scaled grouped forward host-reads offsets and loops per group,
     # which fullgraph compile cannot capture -> rejected at config time.
     with pytest.raises(ValueError, match="torch.compile"):
-        NVFP4FourOverSixGroupedExpertsConverter(
-            NVFP4FourOverSixGroupedExpertsConverter.Config(
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=True,
                 row_scaled_activation=True,
             )
         )
     # Either knob alone stays accepted.
-    NVFP4FourOverSixGroupedExpertsConverter(
-        NVFP4FourOverSixGroupedExpertsConverter.Config(
+    NVFP4GroupedExpertsConverter(
+        NVFP4GroupedExpertsConverter.Config(
             model_compile_enabled=True,
         )
     )
-    NVFP4FourOverSixGroupedExpertsConverter(
-        NVFP4FourOverSixGroupedExpertsConverter.Config(
+    NVFP4GroupedExpertsConverter(
+        NVFP4GroupedExpertsConverter.Config(
             row_scaled_activation=True,
         )
     )
@@ -703,25 +731,39 @@ def test_four_over_six_grouped_converter_rejects_compile_with_row_scaled(monkeyp
 def test_four_over_six_grouped_converter_rejects_bad_pad_multiple(monkeypatch):
     _four_over_six_grouped_cls()
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
-    from torchtitan.components.quantization import (
-        NVFP4FourOverSixGroupedExpertsConverter,
-    )
+    from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
 
     monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
     # The four-over-six grouped GEMM requires 128-row-aligned token groups, so
     # a dispatcher pad that is not a multiple of 128 is rejected at converter
     # build rather than producing silently wrong numerics on the first forward.
     with pytest.raises(ValueError, match="multiple of 128"):
-        NVFP4FourOverSixGroupedExpertsConverter(
-            NVFP4FourOverSixGroupedExpertsConverter.Config(pad_multiple=64)
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(pad_multiple=64)
         )
+
+
+def test_nvfp4_grouped_converter_rejects_non_four_over_six_recipes(monkeypatch):
+    _four_over_six_grouped_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # torchao wires no RHT/SR grouped GEMM into its dispatcher, so there is no
+    # 'default' grouped path: 'four_over_six' is the only supported recipe.
+    with pytest.raises(ValueError, match="only supported value"):
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(recipe="default")
+        )
+    with pytest.raises(ValueError, match="only supported value"):
+        NVFP4GroupedExpertsConverter(NVFP4GroupedExpertsConverter.Config(recipe="rht"))
 
 
 def test_has_quantization_counts_four_over_six(monkeypatch):
     _four_over_six_grouped_cls()
     from torchtitan.components.quantization import (
         NVFP4FourOverSixLinear,
-        NVFP4FourOverSixLinearConverter,
+        NVFP4LinearConverter,
     )
 
     if NVFP4FourOverSixLinear is None:
@@ -743,7 +785,7 @@ def test_has_quantization_counts_four_over_six(monkeypatch):
     dense = ConfigManager().parse_args(
         ["--module", "llama3", "--config", "llama3_debugmodel"]
     )
-    converter = NVFP4FourOverSixLinearConverter(
-        NVFP4FourOverSixLinearConverter.Config(fqns=["layers"])
+    converter = NVFP4LinearConverter(
+        NVFP4LinearConverter.Config(fqns=["layers"], recipe="four_over_six")
     )
     assert has_quantization(converter.convert(dense.model_spec.model))
