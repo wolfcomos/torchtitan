@@ -604,6 +604,7 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
             row_scaled_activation: bool = False
             backward_override: str | None = None
             weight_block: str = "16x16"
+            cache_quantized_weights_for_inference: bool = True
 
             def __post_init__(self) -> None:
                 # The grouped GEMM requires K % 128 == 0 and N % 128 == 0; both
@@ -630,15 +631,103 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
                 weight_block=config.weight_block,
                 backward_override=config.backward_override,
             )
+            self._cache_quantized_weights_for_inference = (
+                config.cache_quantized_weights_for_inference
+            )
+            # data_ptr -> (weight._version, FourOverSixQuantizedExperts).
+            # Plain attribute, never registered: cached codes/scales must not
+            # enter the state_dict.
+            self._quantized_weight_cache = {}
 
         def _grouped_mm(self, *, A, B_t, offs):
             from torchao.prototype.moe_training.utils import (
                 _quantize_then_scaled_grouped_mm,
             )
 
+            # Inference fast path: weights only change between forwards via
+            # in-place copies (optimizer steps, RL refits), which bump the
+            # version counter views share with their base — so a version-keyed
+            # cache re-quantizes exactly once per weight update. Grad-enabled
+            # forwards must not take it (a cached-weight forward severs the
+            # weight-gradient path), CUDA-graph capture must not take it
+            # (replay never re-runs the Python version check, so a captured
+            # cache hit would serve stale weights forever), and B_t must
+            # alias a persistent parameter — a dtype-cast or unshard
+            # temporary's address and version identify nothing.
+            if (
+                self._cache_quantized_weights_for_inference
+                and not torch.is_grad_enabled()
+                and not torch.compiler.is_compiling()
+                and type(B_t) is torch.Tensor
+                and not self._four_over_six_op_config.pad_token_groups_for_grouped_mm
+                and not (A.is_cuda and torch.cuda.is_current_stream_capturing())
+            ):
+                quantized = self._quantized_weight_for(B_t)
+                if quantized is not None:
+                    from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
+                        four_over_six_grouped_mm_prequantized,
+                    )
+
+                    return four_over_six_grouped_mm_prequantized(
+                        A,
+                        quantized,
+                        offs,
+                        row_scaled_activation=(
+                            self._four_over_six_op_config.row_scaled_activation
+                        ),
+                    )
+
             return _quantize_then_scaled_grouped_mm(
                 A, B_t, config=self._four_over_six_op_config, offs=offs
             )
+
+        def _persistent_weight_version(self, B_t):
+            """Version counter of the module parameter ``B_t`` aliases.
+
+            None when ``B_t`` aliases no parameter of this module — e.g. a
+            fresh dtype-cast temporary (non-bf16 masters) or an FSDP unshard
+            buffer. Such tensors get fresh addresses and version 0 every
+            forward, so caching keyed on them could serve one weight's codes
+            for another after allocator block reuse; callers must fall back
+            to per-forward quantization instead.
+            """
+            storage_ptr = B_t.untyped_storage().data_ptr()
+            for param in self.parameters(recurse=False):
+                if (
+                    type(param.data) is torch.Tensor
+                    and param.untyped_storage().data_ptr() == storage_ptr
+                ):
+                    return param._version
+            return None
+
+        def _quantized_weight_for(self, B_t):
+            version = self._persistent_weight_version(B_t)
+            if version is None:
+                return None
+            key = B_t.untyped_storage().data_ptr()
+            entry = self._quantized_weight_cache.get(key)
+            if entry is not None and entry[0] == version:
+                return entry[1]
+            from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
+                four_over_six_quantize_expert_weights,
+            )
+
+            op_config = self._four_over_six_op_config
+            quantized = four_over_six_quantize_expert_weights(
+                B_t.transpose(-2, -1),
+                err_mode=op_config.err_mode,
+                e4m3_scale_bound=op_config.e4m3_scale_bound,
+                weight_block=op_config.weight_block,
+            )
+            if (
+                key not in self._quantized_weight_cache
+                and len(self._quantized_weight_cache) >= 8
+            ):
+                # Storage churn (weights replaced rather than updated in
+                # place) would otherwise grow the cache without bound.
+                self._quantized_weight_cache.clear()
+            self._quantized_weight_cache[key] = (version, quantized)
+            return quantized
 
     FourOverSixGroupedExperts.__name__ = f"NVFP4FourOverSix{parent_cls.__name__}"
     FourOverSixGroupedExperts.__qualname__ = f"NVFP4FourOverSix{parent_cls.__name__}"
@@ -698,6 +787,21 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         """
         Pad per-expert token groups to this multiple for NVFP4 grouped GEMM
         alignment (the four-over-six grouped GEMM requires 128-row groups).
+        """
+
+        cache_quantized_weights_for_inference: bool = True
+        """
+        Under torch.no_grad() (rollout/inference), quantize each expert weight
+        once per in-place weight version and reuse the cached codes and scales
+        until the weights change, instead of re-quantizing on every forward.
+        Bitwise identical to per-forward quantization; costs extra GPU memory
+        of about 31% of the bf16 expert-weight bytes per rank. Grad-enabled
+        (training) forwards are unaffected; the cache also engages on no-grad
+        trainer forwards over plain bf16 parameters (e.g. a validation pass),
+        where it is numerics-neutral but holds that memory until the next
+        optimizer step re-keys it. Disabled automatically under torch.compile,
+        CUDA-graph capture, and for weights that reach the grouped GEMM as
+        temporaries (non-bf16 masters, FSDP unshard buffers).
         """
 
     def __init__(self, config: Config):
@@ -761,6 +865,9 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
                 row_scaled_activation=self.config.row_scaled_activation,
                 backward_override=self.config.backward_override,
                 weight_block=self.config.weight_block,
+                cache_quantized_weights_for_inference=(
+                    self.config.cache_quantized_weights_for_inference
+                ),
             )
             if parent is None:
                 model_config = new_config
