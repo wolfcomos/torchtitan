@@ -423,3 +423,124 @@ def test_float8_grouped_experts_dcp_round_trip_needs_no_safe_globals(tmp_path):
         source.parameters(), target.parameters(), strict=True
     ):
         torch.testing.assert_close(target_parameter, source_parameter)
+
+
+def test_four_over_six_knob_validation():
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization import NVFP4FourOverSixLinear
+
+    if NVFP4FourOverSixLinear is None:
+        pytest.skip("torchao NVFP4 four-over-six training prototype not available")
+
+    # Bad enum values are rejected at config time, not on the first forward.
+    with pytest.raises(ValueError, match="backward_override"):
+        NVFP4FourOverSixLinear.Config(
+            in_features=128, out_features=128, backward_override="bf16"
+        )
+    with pytest.raises(ValueError, match="weight_block"):
+        NVFP4FourOverSixLinear.Config(
+            in_features=128, out_features=128, weight_block="32x32"
+        )
+    with pytest.raises(ValueError, match="err_mode"):
+        NVFP4FourOverSixLinear.Config(
+            in_features=128, out_features=128, err_mode="msee"
+        )
+    with pytest.raises(ValueError, match="e4m3_scale_bound"):
+        NVFP4FourOverSixLinear.Config(
+            in_features=128, out_features=128, e4m3_scale_bound=512
+        )
+    # A row-scaled four-over-six tensor has no columnwise form for the
+    # quantized wgrad operand.
+    with pytest.raises(ValueError, match="no quantized backward"):
+        NVFP4FourOverSixLinear.Config(
+            in_features=128,
+            out_features=128,
+            row_scaled_activation=True,
+            backward_override="quantized",
+        )
+
+
+def test_nvfp4_four_over_six_linear_converter_plumbs_new_knobs(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import (
+        NVFP4FourOverSixLinear,
+        NVFP4LinearConverter,
+    )
+
+    if NVFP4FourOverSixLinear is None:
+        pytest.skip("torchao NVFP4 four-over-six training prototype not available")
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+
+    config = ConfigManager().parse_args(
+        ["--module", "llama3", "--config", "llama3_debugmodel"]
+    )
+    converter = NVFP4LinearConverter(
+        NVFP4LinearConverter.Config(
+            fqns=["layers"],
+            recipe="four_over_six",
+            backward_override="dequantized",
+            weight_block="1x16",
+        )
+    )
+    model_config = converter.convert(config.model_spec.model)
+
+    converted = [
+        lc
+        for _fqn, lc, _parent, _attr in model_config.traverse(Linear.Config)
+        if isinstance(lc, NVFP4FourOverSixLinear.Config)
+    ]
+    assert converted
+    assert all(lc.backward_override == "dequantized" for lc in converted)
+    assert all(lc.weight_block == "1x16" for lc in converted)
+
+
+def test_has_quantization_counts_four_over_six_linear(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import (
+        NVFP4FourOverSixLinear,
+        NVFP4LinearConverter,
+    )
+
+    if NVFP4FourOverSixLinear is None:
+        pytest.skip("torchao NVFP4 four-over-six training prototype not available")
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+
+    dense = ConfigManager().parse_args(
+        ["--module", "llama3", "--config", "llama3_debugmodel"]
+    )
+    assert not has_quantization(dense.model_spec.model)
+    converter = NVFP4LinearConverter(
+        NVFP4LinearConverter.Config(fqns=["layers"], recipe="four_over_six")
+    )
+    assert has_quantization(converter.convert(dense.model_spec.model))
+
+
+def test_nvfp4_converter_rejects_unknown_recipe(monkeypatch):
+    _nvfp4_linear_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4LinearConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    with pytest.raises(ValueError, match="Unknown NVFP4 recipe"):
+        NVFP4LinearConverter(NVFP4LinearConverter.Config(recipe="rht"))
+
+
+def test_nvfp4_converter_default_recipe_rejects_four_over_six_knobs(monkeypatch):
+    _nvfp4_linear_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4LinearConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # The four-over-six knobs are meaningless under torchao's stock recipe, so
+    # a non-default value is rejected rather than silently ignored.
+    with pytest.raises(ValueError, match="only apply to recipe='four_over_six'"):
+        NVFP4LinearConverter(NVFP4LinearConverter.Config(weight_block="1x16"))
+    # The one error names every offending knob.
+    with pytest.raises(ValueError, match="err_mode, row_scaled_activation"):
+        NVFP4LinearConverter(
+            NVFP4LinearConverter.Config(err_mode="mse", row_scaled_activation=True)
+        )
+    # Knobs left at their defaults stay accepted under recipe='default'.
+    NVFP4LinearConverter(NVFP4LinearConverter.Config(err_mode="mae"))
