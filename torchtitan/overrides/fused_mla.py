@@ -829,6 +829,13 @@ class FusedMLAAttention(Attention):
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+        if q._is_view():
+            # A quantized-linear wq (e.g. torchao MXFP8Linear) returns its
+            # output as a view created inside a custom Function; autograd
+            # forbids the in-place _FusedMLAQ rotation on views of such
+            # outputs. Clone to give the rope a rebasable base (stock
+            # nn.Linear returns a non-view, keeping the copy-free path).
+            q = q.clone()
 
         with spmd.local():
             q = q.view(num_tokens, -1, self.qk_head_dim)
