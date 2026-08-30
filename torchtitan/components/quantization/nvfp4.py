@@ -548,12 +548,12 @@ class NVFP4FourOverSixLinearConverter(QuantizationConverter):
 
 
 try:
-    from torchao.prototype.moe_training.nvfp4_training.four_over_six_grouped import (
-        four_over_six_grouped_mm,
+    from torchao.prototype.moe_training.config import (
+        NVFP4FourOverSixTrainingOpConfig,
     )
 
 except ImportError:
-    four_over_six_grouped_mm = None
+    NVFP4FourOverSixTrainingOpConfig = None
 
 
 _four_over_six_experts_cache: dict[type, type] = {}
@@ -568,8 +568,10 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
     ``_owner`` set by ``__init_subclass__``.
 
     The subclass overrides ``_grouped_mm`` to call torchao's
-    ``four_over_six_grouped_mm``. Four-over-six needs no RHT sign vector and no
-    stochastic-rounding seed, so the stateless hook carries everything.
+    ``_quantize_then_scaled_grouped_mm`` dispatcher with a
+    ``NVFP4FourOverSixTrainingOpConfig``, exactly like the MXFP8 analog.
+    Four-over-six needs no RHT sign vector and no stochastic-rounding seed,
+    so the stateless config carries everything.
     """
     if parent_cls in _four_over_six_experts_cache:
         return _four_over_six_experts_cache[parent_cls]
@@ -603,7 +605,7 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
 
         def __init__(self, config: Config):
             super().__init__(config)
-            self._four_over_six_kwargs = dict(
+            self._four_over_six_op_config = NVFP4FourOverSixTrainingOpConfig(
                 err_mode=config.err_mode,
                 e4m3_scale_bound=config.e4m3_scale_bound,
                 row_scaled_activation=config.row_scaled_activation,
@@ -612,26 +614,13 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
             )
 
         def _grouped_mm(self, *, A, B_t, offs):
-            # The hook receives B_t pre-transposed to (E, K, N); the torchao op
-            # takes expert weights in their stored (E, N, K) layout (it makes
-            # the operands contiguous itself).
-            #
-            # The swapped TorchAOTokenDispatcher already 128-aligns every
-            # expert group but over-allocates the activation buffer past
-            # offs[-1], while the torchao op requires offs[-1] == A.shape[0]
-            # and the unwritten tail rows must not feed the per-group amaxes.
-            # Slice to the logical rows, skip the op's own padding, and
-            # zero-extend the output (pad routes zero grads to the tail;
-            # the unpermute never reads tail rows).
-            m_total = int(offs[-1])
-            out = four_over_six_grouped_mm(
-                A[:m_total],
-                B_t.transpose(-2, -1),
-                offs,
-                pad_token_groups_for_grouped_mm=False,
-                **self._four_over_six_kwargs,
+            from torchao.prototype.moe_training.utils import (
+                _quantize_then_scaled_grouped_mm,
             )
-            return torch.nn.functional.pad(out, (0, 0, 0, A.shape[0] - m_total))
+
+            return _quantize_then_scaled_grouped_mm(
+                A, B_t, config=self._four_over_six_op_config, offs=offs
+            )
 
     FourOverSixGroupedExperts.__name__ = f"NVFP4FourOverSix{parent_cls.__name__}"
     FourOverSixGroupedExperts.__qualname__ = f"NVFP4FourOverSix{parent_cls.__name__}"
@@ -689,15 +678,23 @@ class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
     def __init__(self, config: Config):
         self.config = config
 
-        if four_over_six_grouped_mm is None:
+        if NVFP4FourOverSixTrainingOpConfig is None:
             raise ImportError(
-                "torchao is not installed or does not provide the NVFP4 "
-                "four-over-six grouped training prototype. Install a torchao "
-                "build with torchao.prototype.moe_training.nvfp4_training."
+                "torchao is not installed or its grouped GEMM dispatcher does "
+                "not support NVFP4 four-over-six. Install a torchao build with "
+                "NVFP4FourOverSixTrainingOpConfig in "
+                "torchao.prototype.moe_training.config."
             )
 
         if not has_cuda_capability(10, 0):
             raise ValueError("NVFP4 is only supported on SM100 or later architectures")
+
+        if self.config.pad_multiple % _NVFP4_BLOCK:
+            raise ValueError(
+                f"pad_multiple must be a multiple of {_NVFP4_BLOCK}; got "
+                f"{self.config.pad_multiple}. The four-over-six grouped GEMM "
+                "requires 128-row-aligned token groups."
+            )
 
         if self.config.model_compile_enabled and self.config.row_scaled_activation:
             raise ValueError(
@@ -714,7 +711,7 @@ class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
             )
 
     def convert(self, model_config):
-        assert four_over_six_grouped_mm is not None
+        assert NVFP4FourOverSixTrainingOpConfig is not None
         fqns = self.config.fqns
         for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
             if fqns and not any(target_fqn in fqn for target_fqn in fqns):
