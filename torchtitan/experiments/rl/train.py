@@ -24,6 +24,7 @@ python3 -m torchtitan.experiments.rl.train \
 
 import asyncio
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -139,6 +140,44 @@ class HostMeshes:
     trainer: HostMesh
     generators: list[HostMesh]
     gpus_per_node: int
+
+
+def _host_meshes_from_env(num_generators: int) -> HostMeshes | None:
+    """Cross-node meshes from ``RL_GENERATOR_WORKER_ADDRS``, or None.
+
+    The env var holds one comma-separated monarch worker address per
+    generator (e.g. ``tcp://other-node:26600``); each remote node runs
+
+        python3 -c "from monarch._src.actor.bootstrap import \\
+            run_worker_loop_forever; \\
+            run_worker_loop_forever(ca='trust_all_connections', \\
+            address='tcp://<its-fqdn>:26600')"
+
+    inside the same container/env as this entrypoint. The trainer stays on
+    this host; ``RL_GPUS_PER_NODE`` (default 8) tells the provisioner how
+    many GPUs each node exposes.
+    """
+    addrs = os.environ.get("RL_GENERATOR_WORKER_ADDRS")
+    if not addrs:
+        return None
+    from monarch._src.actor.bootstrap import attach_to_workers
+
+    addr_list = [a for a in addrs.split(",") if a]
+    assert len(addr_list) == num_generators, (
+        f"RL_GENERATOR_WORKER_ADDRS lists {len(addr_list)} worker(s) but "
+        f"num_generators is {num_generators}"
+    )
+    generators = [
+        attach_to_workers(
+            name=f"generator{i}", ca="trust_all_connections", workers=[addr]
+        )
+        for i, addr in enumerate(addr_list)
+    ]
+    return HostMeshes(
+        trainer=this_host(),
+        generators=generators,
+        gpus_per_node=int(os.environ.get("RL_GPUS_PER_NODE", "8")),
+    )
 
 
 def _compute_trainer_world_size(p: ParallelismConfig) -> int:
@@ -290,7 +329,7 @@ async def main():
         trainer_mesh, generator_meshes = spawn_proc_mesh(
             trainer_world_size,
             per_generator_world_size,
-            host_meshes=None,
+            host_meshes=_host_meshes_from_env(config.num_generators),
             num_generators=config.num_generators,
             generator_env=breakable_cudagraph_env(config.generator),
         )
