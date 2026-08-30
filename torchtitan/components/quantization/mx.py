@@ -130,10 +130,21 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
             )
 
             recipe = MXFP8TrainingRecipe(config.recipe_name)
-            self._mxfp8_op_config = replace(
-                MXFP8TrainingOpConfig.from_recipe(recipe),
-                backward_override=config.backward_override,
-            )
+            self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+            # Installed torchao builds may predate the backward_override knob;
+            # only replace() when it is set so the stock recipes keep working.
+            if config.backward_override is not None:
+                if "backward_override" not in {
+                    f.name for f in fields(MXFP8TrainingOpConfig)
+                }:
+                    raise ValueError(
+                        "the installed torchao does not support "
+                        "backward_override for MXFP8 grouped GEMMs"
+                    )
+                self._mxfp8_op_config = replace(
+                    self._mxfp8_op_config,
+                    backward_override=config.backward_override,
+                )
 
         def _grouped_mm(self, *, A, B_t, offs):
             from torchao.prototype.moe_training.utils import (
