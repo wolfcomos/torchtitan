@@ -3,8 +3,11 @@
 Reduced-scale replication of the six-configuration RL quantization ablation
 from [lmsys.org/blog/2026-07-29-mxfp8-nvfp4-rl](https://lmsys.org/blog/2026-07-29-mxfp8-nvfp4-rl)
 on TitanRL (`torchtitan.experiments.rl`) with the torchao-backed
-`MXFP8GroupedExpertsConverter` / `NVFP4FourOverSixGroupedExpertsConverter`
-from this branch. Run 2026-08-25/26 on one GB200 node (4 GPUs).
+`MXFP8GroupedExpertsConverter` / `NVFP4GroupedExpertsConverter`
+(the NVFP4 grouped converter carried a four-over-six-specific class name at
+run time; it was renamed, implementation unchanged, in the later
+recipe-selector consolidation) from this branch. Run 2026-08-25/26 on one
+GB200 node (4 GPUs).
 
 ![training curves](training_curves.png)
 
