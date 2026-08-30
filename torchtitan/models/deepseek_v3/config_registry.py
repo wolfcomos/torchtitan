@@ -268,3 +268,65 @@ def deepseek_v3_671b_float8() -> Trainer.Config:
         ],
     )
     return config
+
+
+def deepseek_v3_16b_mxfp8() -> Trainer.Config:
+    # 16B analog of deepseek_v3_debugmodel_mxfp8, self-contained for a 4-GPU
+    # eval box: c4_test + the bundled test tokenizer (no asset downloads),
+    # expert_parallel_degree=4, 50 steps, and round-robin expert load
+    # balancing so paired A/B arms see identical routing work.
+    config = deepseek_v3_16b()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        converters=[
+            MXFP8LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=["attention", "shared_experts", "feed_forward"],
+            ),
+            MXFP8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    config.hf_assets_path = "./tests/assets/tokenizer"
+    config.dataloader = GrainDataLoader.Config(
+        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+    )
+    config.training.steps = 50
+    config.parallelism.expert_parallel_degree = 4
+    config.debug.moe_force_load_balance = True
+    return config
+
+
+def deepseek_v3_16b_mxfp8_mla_qrope() -> Trainer.Config:
+    # deepseek_v3_16b_mxfp8 plus ONLY the fused MXFP8 Q-projection + RoPE
+    # override -- a single-toggle A/B pair sharing seed checkpoints.
+    config = deepseek_v3_16b_mxfp8()
+    override = "torchtitan.overrides.mxfp8_mla_q_rope.mxfp8_mla_q_rope"
+    assert override not in config.override.imports
+    config.override.imports.append(override)
+    return config
+
+
+def deepseek_v3_16b_mxfp8_fused_mla() -> Trainer.Config:
+    # deepseek_v3_16b_mxfp8 plus ONLY the stock BF16 fused-MLA override
+    # (attribution arm: the rope/assembly fusion win without quantization).
+    config = deepseek_v3_16b_mxfp8()
+    override = "torchtitan.overrides.fused_mla.fused_mla"
+    assert override not in config.override.imports
+    config.override.imports.append(override)
+    return config
+
+
+def deepseek_v3_debugmodel_mxfp8_mla_qrope() -> Trainer.Config:
+    # Smoke flavor: debugmodel_mxfp8 plus the fused Q-projection override.
+    config = deepseek_v3_debugmodel_mxfp8()
+    override = "torchtitan.overrides.mxfp8_mla_q_rope.mxfp8_mla_q_rope"
+    assert override not in config.override.imports
+    config.override.imports.append(override)
+    return config
