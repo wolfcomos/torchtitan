@@ -83,11 +83,13 @@ from torchao.prototype.mx_formats.utils import _to_mxfp8_dim1_kernel_wrapper
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
 from torchtitan.config import derive, override
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.deepseek_v3.model import Attention
 
 __all__ = [
+    "MLAQRopeSelectiveAC",
     "MXFP8MLAQRopeAttention",
     "mxfp8_mla_q_rope",
 ]
@@ -319,6 +321,29 @@ class MXFP8MLAQRopeAttention(Attention):
         ).contiguous()
         output = output.view(num_tokens, -1)
         return self.wo(output)
+
+
+class MLAQRopeSelectiveAC(SelectiveAC):
+    """SelectiveAC that additionally saves the fused Q-projection composite.
+
+    The fused op and the dequant bridge are custom ops outside the stock SAC
+    save set, so stock ``SelectiveAC`` recomputes the whole Q composite in
+    backward -- two fused-kernel launches (and two wrapper CPU enqueues) per
+    layer-step. Saving both ops' outputs trades memory (the op's fp8
+    codes/scales, including the currently-unused columnwise pair, plus the
+    BF16 dequantized Q) for that recompute. The stock every-second-matmul
+    policy is untouched.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(SelectiveAC.Config):
+        pass
+
+    def get_save_ops(self) -> set:
+        save_ops = set(super().get_save_ops())
+        save_ops.add(torch.ops.torchao.mxfp8_mla_q_proj_rope_cudnn.default)
+        save_ops.add(torch.ops.torchao.triton_mxfp8_dequant_dim0.default)
+        return save_ops
 
 
 @override(

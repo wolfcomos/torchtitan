@@ -330,3 +330,15 @@ def deepseek_v3_debugmodel_mxfp8_mla_qrope() -> Trainer.Config:
     assert override not in config.override.imports
     config.override.imports.append(override)
     return config
+
+
+def deepseek_v3_16b_mxfp8_mla_qrope_sacsave() -> Trainer.Config:
+    # deepseek_v3_16b_mxfp8_mla_qrope with the fused Q composite added to the
+    # SAC save set (remedy arm for the recompute-doubled wrapper CPU cost):
+    # identical numerics, different caching. Imported lazily because the
+    # override module requires torchao.
+    from torchtitan.overrides.mxfp8_mla_q_rope import MLAQRopeSelectiveAC
+
+    config = deepseek_v3_16b_mxfp8_mla_qrope()
+    config.activation_checkpoint = MLAQRopeSelectiveAC.Config()
+    return config
