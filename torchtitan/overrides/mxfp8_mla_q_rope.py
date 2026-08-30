@@ -12,12 +12,14 @@ Activate with::
 
     --override.imports torchtitan.overrides.mxfp8_mla_q_rope.mxfp8_mla_q_rope
 
-Replaces the DeepSeek-V3 ``Attention`` Q path (``wq`` GEMM -> head view ->
-ComplexRoPE on the rotary tail) with one torchao custom op wrapping the
-cudnn-frontend ``gemm_proj_rope_mxfp8_wrapper_sm100`` kernel (the fusion
-TransformerEngine PR #3303 wires for DeepSeek-V3 MLA MXFP8 training): MXFP8
-projection GEMM + per-head YARN RoPE + rowwise AND columnwise MXFP8
-quantization of Q, with no BF16 Q round trip inside the kernel.
+Replaces the DeepSeek-V3 ``Attention`` Q projection (``wq`` GEMM when
+``q_lora_rank == 0``; the ``wq_b`` GEMM after the stock ``wq_a``/``q_norm``
+low-rank stage on 236B/671B-class configs) -> head view -> ComplexRoPE on
+the rotary tail with one torchao custom op wrapping the cudnn-frontend
+``gemm_proj_rope_mxfp8_wrapper_sm100`` kernel (the fusion TransformerEngine
+PR #3303 wires for DeepSeek-V3 MLA MXFP8 training): MXFP8 projection GEMM +
+per-head YARN RoPE + rowwise AND columnwise MXFP8 quantization of Q, with no
+BF16 Q round trip inside the kernel.
 
 Because torchtitan's inner attention runs BF16 (no MXFP8 SDPA backend), the
 rowwise MXFP8 Q is dequantized back to BF16 for ``inner_attention``; the
@@ -37,7 +39,8 @@ reproduce ``torchao.prototype.moe_training.mxfp8_linear``'s backward verbatim
 (STE through the output quantize, the TE #3330 ``bf16_backward`` convention).
 
 The override keeps the stock Attention parameters and state-dict layout; it
-reads ``self.wq.weight`` directly and never calls ``wq.forward``. Fail-loud:
+reads the Q projection weight (``wq.weight``, or ``wq_b.weight`` on the
+low-rank path) directly and never calls that linear's forward. Fail-loud:
 every configuration the kernel cannot execute raises at config-application
 time (or at first forward for runtime-only contracts); there is no silent
 fallback.
@@ -224,13 +227,20 @@ class MXFP8MLAQRopeAttention(Attention):
                 "training.num_tokens_per_microbatch_per_dp_rank or remove the "
                 "override."
             )
-        w = self.wq.weight
+        if self.q_lora_rank == 0:
+            q_in, w = x, self.wq.weight
+        else:
+            # 236B/671B-class Q path: the fused op replaces the wq_b GEMM;
+            # wq_a and q_norm stay stock (wq_a keeps whatever converter
+            # quantization the config applied to it).
+            q_in = self.q_norm(self.wq_a(x))
+            w = self.wq_b.weight
         if isinstance(w, DTensor):
             raise RuntimeError(
                 "MXFP8MLAQRopeAttention does not support a tensor-parallel "
-                "wq (the quantize kernels and the fused op consume plain "
-                "local tensors); run with tensor_parallel_degree=1 or remove "
-                "the override."
+                "Q projection (the quantize kernels and the fused op consume "
+                "plain local tensors); run with tensor_parallel_degree=1 or "
+                "remove the override."
             )
 
         # Per-token complex rope cache through the stock machinery (positions
@@ -241,7 +251,7 @@ class MXFP8MLAQRopeAttention(Attention):
         )
         cos, sin, cos32, sin32 = _rope_tables(cache_c)
 
-        q = _MXFP8MLAQProjRope.apply(x, w, cos, sin, cos32, sin32)
+        q = _MXFP8MLAQProjRope.apply(q_in, w, cos, sin, cos32, sin32)
         with spmd.local():
             if spmd.is_type_checking():
                 spmd.assert_type(
@@ -339,22 +349,20 @@ def mxfp8_mla_q_rope(cfg: Attention.Config) -> MXFP8MLAQRopeAttention.Config:
             "mxfp8_mla_q_rope requires ComplexRoPE (the kernel implements its "
             f"adjacent-pair rotation), got {type(cfg.rope).__qualname__}."
         )
-    if cfg.q_lora_rank != 0:
-        raise ValueError(
-            "mxfp8_mla_q_rope currently fuses only the direct wq projection "
-            f"(q_lora_rank == 0); got q_lora_rank={cfg.q_lora_rank}, whose Q "
-            "path is wq_b(q_norm(wq_a(x))). Wire the wq_b seam before using "
-            "this override on 236B/671B-class configs."
-        )
+    # The fused GEMM's contraction dim is the Q projection's input width:
+    # dim for the direct wq path, q_lora_rank for the wq_b(q_norm(wq_a(x)))
+    # low-rank path (236B/671B-class configs).
+    in_features = cfg.q_lora_rank if cfg.q_lora_rank != 0 else cfg.dim
     if not is_supported(
-        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, cfg.dim, cfg.n_heads
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, in_features, cfg.n_heads
     ):
         raise ValueError(
             "mxfp8_mla_q_rope: unsupported dims for the fused kernel "
             f"(qk_nope_head_dim={cfg.qk_nope_head_dim}, qk_rope_head_dim="
-            f"{cfg.qk_rope_head_dim}, dim={cfg.dim}, n_heads={cfg.n_heads}); "
-            "the kernel requires the fixed 128+64 head geometry, dim % 128 "
-            "== 0, and an even head count of at least 8 (smaller counts "
-            "produce numerically corrupt kernel output)."
+            f"{cfg.qk_rope_head_dim}, in_features={in_features}, "
+            f"n_heads={cfg.n_heads}); the kernel requires the fixed 128+64 "
+            "head geometry, in_features % 128 == 0 (dim when q_lora_rank == "
+            "0, else q_lora_rank), and an even head count of at least 8 "
+            "(smaller counts produce numerically corrupt kernel output)."
         )
     return derive(cfg, MXFP8MLAQRopeAttention.Config)
