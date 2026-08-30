@@ -14,7 +14,7 @@ from torchtitan.components.quantization import (
     Float8LinearConverter,
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
-    NVFP4FourOverSixGroupedExpertsConverter,
+    NVFP4GroupedExpertsConverter,
 )
 from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_first_last_fqns
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
@@ -133,7 +133,7 @@ def _deepseek_v3_debugmodel_nvfp4_four_over_six(
     config.model_spec = model_registry(
         "debugmodel",
         converters=[
-            NVFP4FourOverSixGroupedExpertsConverter.Config(
+            NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns or [],
                 row_scaled_activation=True,

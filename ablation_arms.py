@@ -26,7 +26,7 @@ weight decay 0 on the quantized expert weights (0.1 elsewhere).
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.components.quantization import (
     MXFP8GroupedExpertsConverter,
-    NVFP4FourOverSixGroupedExpertsConverter,
+    NVFP4GroupedExpertsConverter,
 )
 from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_first_last_fqns
 from torchtitan.experiments.rl.components.batcher import BatchConfig, Batcher
@@ -124,7 +124,7 @@ def _ablation_base(converters: list | None) -> Controller.Config:
 
 
 def _nvfp4_converter(backward_override: str):
-    return NVFP4FourOverSixGroupedExpertsConverter.Config(
+    return NVFP4GroupedExpertsConverter.Config(
         fqns=_QUANTIZED_LAYER_FQNS,
         row_scaled_activation=True,
         err_mode="mse",

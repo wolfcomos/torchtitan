@@ -16,7 +16,7 @@ import dataclasses
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
-from torchtitan.components.quantization import NVFP4FourOverSixGroupedExpertsConverter
+from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
 from torchtitan.config import (
     CompileConfig,
     DebugConfig,
@@ -807,7 +807,7 @@ def rl_grpo_qwen3_30b_a3b_varlen_nvfp4_four_over_six() -> Controller.Config:
         "30B-A3B",
         attn_backend="varlen",
         converters=[
-            NVFP4FourOverSixGroupedExpertsConverter.Config(
+            NVFP4GroupedExpertsConverter.Config(
                 row_scaled_activation=True,
                 err_mode="mse",
                 e4m3_scale_bound=256,

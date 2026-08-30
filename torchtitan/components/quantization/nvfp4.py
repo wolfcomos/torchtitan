@@ -328,60 +328,6 @@ def _validate_four_over_six_knobs(
         )
 
 
-class NVFP4LinearConverter(QuantizationConverter):
-    """Replace matching Linear.Config with NVFP4Linear.Config."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(QuantizationConverter.Config):
-        fqns: list[str] = field(default_factory=list)
-        """
-        List of fully qualified names of modules to apply NVFP4 quantization to.
-        Only Linear.Config entries whose FQN contains a match are converted.
-        If empty, all Linear modules are converted -- pass explicit fqns to keep
-        the LM head in bf16, which the mixed recipe leaves unquantized for stability.
-        """
-
-    def __init__(self, config: Config):
-        self.config = config
-
-        if NVFP4Linear is None:
-            raise ImportError(
-                "torchao is not installed or does not provide the NVFP4 training "
-                "prototype. Install a torchao build with "
-                "torchao.prototype.moe_training.nvfp4_training."
-            )
-
-        if not has_cuda_capability(10, 0):
-            raise ValueError("NVFP4 is only supported on SM100 or later architectures")
-
-        if not self.config.model_compile_enabled:
-            logger.warning(
-                "torch.compile enablement is required for highest performance "
-                "of NVFP4 dynamic quantization."
-            )
-
-    def convert(self, model_config):
-        assert NVFP4Linear is not None
-        fqns = self.config.fqns
-        for fqn, config, parent, attr in model_config.traverse(Linear.Config):
-            if not fqns or any(target_fqn in fqn for target_fqn in fqns):
-                new_config = NVFP4Linear.Config(
-                    in_features=config.in_features,
-                    out_features=config.out_features,
-                    bias=config.bias,
-                    param_init=config.param_init,
-                )
-                if parent is None:
-                    model_config = new_config
-                elif isinstance(parent, list):
-                    parent[attr] = new_config
-                else:
-                    setattr(parent, attr, new_config)
-
-        logger.info("Converted Linear layers to NVFP4Linear")
-        return model_config
-
-
 try:
     from torchao.prototype.moe_training.nvfp4_training.four_over_six import (
         four_over_six_linear,
@@ -470,41 +416,90 @@ except ImportError:
     NVFP4FourOverSixLinear = None
 
 
-class NVFP4FourOverSixLinearConverter(QuantizationConverter):
-    """Replace matching Linear.Config with NVFP4FourOverSixLinear.Config."""
+# The converter knobs that only the four-over-six recipe reads;
+# NVFP4LinearConverter rejects non-default values under recipe="default".
+_FOUR_OVER_SIX_KNOB_NAMES = (
+    "err_mode",
+    "e4m3_scale_bound",
+    "row_scaled_activation",
+    "backward_override",
+    "weight_block",
+)
+
+
+class NVFP4LinearConverter(QuantizationConverter):
+    """Replace matching Linear.Config with the selected NVFP4 recipe's config:
+    NVFP4Linear.Config (recipe='default') or NVFP4FourOverSixLinear.Config
+    (recipe='four_over_six')."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(QuantizationConverter.Config):
         fqns: list[str] = field(default_factory=list)
         """
-        List of fully qualified names of modules to apply four-over-six NVFP4
-        quantization to. Only Linear.Config entries whose FQN contains a match
-        are converted. If empty, all Linear modules are converted -- pass
-        explicit fqns to keep the LM head in bf16.
+        List of fully qualified names of modules to apply NVFP4 quantization to.
+        Only Linear.Config entries whose FQN contains a match are converted.
+        If empty, all Linear modules are converted -- pass explicit fqns to keep
+        the LM head in bf16, which the mixed recipe leaves unquantized for stability.
+        """
+
+        recipe: str = "default"
+        """
+        NVFP4 recipe selector. 'default' keeps torchao's NVFP4 recipe (random
+        Hadamard transform + stochastic rounding, stateful per-rank buffers);
+        'four_over_six' selects the stateless adaptive block-scale recipe.
         """
 
         err_mode: str = "mae"
-        """Candidate-selection error metric, 'mae' or 'mse'."""
+        """Candidate-selection error metric, 'mae' or 'mse'. Read only under
+        recipe='four_over_six'."""
 
         e4m3_scale_bound: int = 256
-        """Global E4M3 scale bound; 256 leaves map-to-4 headroom."""
+        """Global E4M3 scale bound; 256 leaves map-to-4 headroom. Read only
+        under recipe='four_over_six'."""
 
         row_scaled_activation: bool = False
-        """One FP32 global scale per activation row instead of per tensor."""
+        """One FP32 global scale per activation row instead of per tensor.
+        Read only under recipe='four_over_six'."""
 
         backward_override: str | None = None
         """'quantized', 'high_precision', or 'dequantized' (mirrors
         TransformerEngine's NVTE_BACKWARD_OVERRIDE). None keeps the recipe
-        defaults."""
+        defaults. Read only under recipe='four_over_six'."""
 
         weight_block: str = "16x16"
         """Weight tile granularity; '1x16' mirrors
-        NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1."""
+        NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1. Read only under
+        recipe='four_over_six'."""
 
     def __init__(self, config: Config):
         self.config = config
 
-        if NVFP4FourOverSixLinear is None:
+        if self.config.recipe not in ("default", "four_over_six"):
+            raise ValueError(
+                f"Unknown NVFP4 recipe {self.config.recipe!r}; expected "
+                "'default' or 'four_over_six'."
+            )
+
+        if self.config.recipe == "default":
+            if NVFP4Linear is None:
+                raise ImportError(
+                    "torchao is not installed or does not provide the NVFP4 training "
+                    "prototype. Install a torchao build with "
+                    "torchao.prototype.moe_training.nvfp4_training."
+                )
+            offending = [
+                f.name
+                for f in fields(self.config)
+                if f.name in _FOUR_OVER_SIX_KNOB_NAMES
+                and getattr(self.config, f.name) != f.default
+            ]
+            if offending:
+                raise ValueError(
+                    f"{', '.join(offending)} only apply to recipe='four_over_six'; "
+                    "recipe='default' keeps torchao's NVFP4 recipe (RHT + "
+                    "stochastic rounding) and takes no four-over-six knobs."
+                )
+        elif NVFP4FourOverSixLinear is None:
             raise ImportError(
                 "torchao is not installed or does not provide the NVFP4 "
                 "four-over-six training prototype. Install a torchao build "
@@ -521,6 +516,29 @@ class NVFP4FourOverSixLinearConverter(QuantizationConverter):
             )
 
     def convert(self, model_config):
+        if self.config.recipe == "four_over_six":
+            return self._convert_four_over_six(model_config)
+        assert NVFP4Linear is not None
+        fqns = self.config.fqns
+        for fqn, config, parent, attr in model_config.traverse(Linear.Config):
+            if not fqns or any(target_fqn in fqn for target_fqn in fqns):
+                new_config = NVFP4Linear.Config(
+                    in_features=config.in_features,
+                    out_features=config.out_features,
+                    bias=config.bias,
+                    param_init=config.param_init,
+                )
+                if parent is None:
+                    model_config = new_config
+                elif isinstance(parent, list):
+                    parent[attr] = new_config
+                else:
+                    setattr(parent, attr, new_config)
+
+        logger.info("Converted Linear layers to NVFP4Linear")
+        return model_config
+
+    def _convert_four_over_six(self, model_config):
         assert NVFP4FourOverSixLinear is not None
         fqns = self.config.fqns
         for fqn, config, parent, attr in model_config.traverse(Linear.Config):
@@ -628,7 +646,7 @@ def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
     return FourOverSixGroupedExperts
 
 
-class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
+class NVFP4GroupedExpertsConverter(QuantizationConverter):
     """Apply four-over-six NVFP4 quantization to MoE expert grouped GEMMs.
 
     The miles NVFP4 RL recipes quantize only the routed-expert projections;
@@ -649,6 +667,13 @@ class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
         List of fully qualified names of modules to apply four-over-six NVFP4
         quantization to. Only GroupedExperts.Config entries whose FQN contains
         a match are converted. If empty, all GroupedExperts are converted.
+        """
+
+        recipe: str = "four_over_six"
+        """
+        NVFP4 grouped-experts recipe selector; 'four_over_six' is the only
+        supported value today -- torchao wires no RHT/SR grouped GEMM into
+        its dispatcher, so there is no 'default' grouped path.
         """
 
         err_mode: str = "mae"
@@ -677,6 +702,14 @@ class NVFP4FourOverSixGroupedExpertsConverter(QuantizationConverter):
 
     def __init__(self, config: Config):
         self.config = config
+
+        if self.config.recipe != "four_over_six":
+            raise ValueError(
+                f"Unknown NVFP4 grouped-experts recipe {self.config.recipe!r}; "
+                "'four_over_six' is the only supported value today (torchao "
+                "wires no RHT/SR grouped GEMM into its dispatcher, so there "
+                "is no 'default' grouped path)."
+            )
 
         if NVFP4FourOverSixTrainingOpConfig is None:
             raise ImportError(

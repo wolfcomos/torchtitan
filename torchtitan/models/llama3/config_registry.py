@@ -20,7 +20,6 @@ from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.components.quantization import (
     Float8LinearConverter,
     MXFP8LinearConverter,
-    NVFP4FourOverSixLinearConverter,
     NVFP4LinearConverter,
 )
 from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
@@ -151,8 +150,9 @@ def llama3_debugmodel_nvfp4_four_over_six() -> Trainer.Config:
     config.model_spec = model_registry(
         "debugmodel",
         converters=[
-            NVFP4FourOverSixLinearConverter.Config(
+            NVFP4LinearConverter.Config(
                 fqns=["layers"],
+                recipe="four_over_six",
                 model_compile_enabled=model_compile_enabled,
             ),
         ],
