@@ -378,6 +378,35 @@ def test_quantized_grouped_experts():
     assert hasattr(float8_cls.Config, "swiglu_limit")
 
 
+def test_mxfp8_backward_override_guard_on_older_torchao(monkeypatch):
+    """Building MXFP8 experts against a torchao whose MXFP8TrainingOpConfig
+    predates the backward_override field succeeds while the knob is unset, and
+    fails with an actionable error when the knob is set."""
+    pytest.importorskip("torchao")
+    import dataclasses
+
+    import torchao.prototype.moe_training.config as ao_config_mod
+
+    @dataclasses.dataclass
+    class OlderOpConfig:
+        # Deliberately no backward_override field, like released torchao.
+        @classmethod
+        def from_recipe(cls, recipe):
+            return cls()
+
+    monkeypatch.setattr(ao_config_mod, "MXFP8TrainingOpConfig", OlderOpConfig)
+
+    mxfp8_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts)
+    # The unset knob never touches the missing field, so the build succeeds.
+    module = mxfp8_cls.Config(dim=16, hidden_dim=32, num_experts=2).build()
+    assert isinstance(module._mxfp8_op_config, OlderOpConfig)
+    # A set knob cannot be honored by this torchao -> actionable error.
+    with pytest.raises(ValueError, match="does not support backward_override"):
+        mxfp8_cls.Config(
+            dim=16, hidden_dim=32, num_experts=2, backward_override="dequantized"
+        ).build()
+
+
 @pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
 def test_float8_grouped_experts_checkpoint_state_uses_plain_tensors(parent_cls):
     pytest.importorskip("torchao")
@@ -450,7 +479,7 @@ def _four_over_six_grouped_cls():
     pytest.importorskip("torchao")
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    if nvfp4_mod.four_over_six_grouped_mm is None:
+    if nvfp4_mod.NVFP4FourOverSixTrainingOpConfig is None:
         pytest.skip("torchao four-over-six grouped training prototype not available")
     return nvfp4_mod._get_four_over_six_grouped_experts_cls
 
@@ -482,15 +511,14 @@ def test_four_over_six_grouped_experts_cls():
     )
     assert config.backward_override == "dequantized"
 
-    # The built module carries every knob into the grouped-GEMM call.
+    # The built module carries every knob into the grouped-GEMM op config.
     module = config.build()
-    assert module._four_over_six_kwargs == dict(
-        err_mode="mse",
-        e4m3_scale_bound=256,
-        row_scaled_activation=True,
-        weight_block="1x16",
-        backward_override="dequantized",
-    )
+    op_config = module._four_over_six_op_config
+    assert op_config.err_mode == "mse"
+    assert op_config.e4m3_scale_bound == 256
+    assert op_config.row_scaled_activation is True
+    assert op_config.weight_block == "1x16"
+    assert op_config.backward_override == "dequantized"
 
 
 def test_four_over_six_knob_validation():
@@ -670,6 +698,23 @@ def test_four_over_six_grouped_converter_rejects_compile_with_row_scaled(monkeyp
             row_scaled_activation=True,
         )
     )
+
+
+def test_four_over_six_grouped_converter_rejects_bad_pad_multiple(monkeypatch):
+    _four_over_six_grouped_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import (
+        NVFP4FourOverSixGroupedExpertsConverter,
+    )
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # The four-over-six grouped GEMM requires 128-row-aligned token groups, so
+    # a dispatcher pad that is not a multiple of 128 is rejected at converter
+    # build rather than producing silently wrong numerics on the first forward.
+    with pytest.raises(ValueError, match="multiple of 128"):
+        NVFP4FourOverSixGroupedExpertsConverter(
+            NVFP4FourOverSixGroupedExpertsConverter.Config(pad_multiple=64)
+        )
 
 
 def test_has_quantization_counts_four_over_six(monkeypatch):
