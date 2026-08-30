@@ -316,6 +316,18 @@ def deepseek_v3_16b_mxfp8_mla_qrope() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_16b_mxfp8_mla_qrope_teattn() -> Trainer.Config:
+    # deepseek_v3_16b_mxfp8 plus the fused Q-projection override feeding TE
+    # MXFP8 fused attention directly (arm E: no dequant bridge, columnwise Q
+    # load-bearing; causal-per-4096-window instead of the flex doc mask --
+    # a disclosed semantics delta of this arm).
+    config = deepseek_v3_16b_mxfp8()
+    _enable_override(
+        config, "torchtitan.overrides.mxfp8_mla_q_rope.mxfp8_mla_q_rope_te_attn"
+    )
+    return config
+
+
 def deepseek_v3_16b_mxfp8_fused_mla() -> Trainer.Config:
     # deepseek_v3_16b_mxfp8 plus ONLY the stock BF16 fused-MLA override
     # (attribution arm: the rope/assembly fusion win without quantization).

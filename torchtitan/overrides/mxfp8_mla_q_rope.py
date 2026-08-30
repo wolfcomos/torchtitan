@@ -88,7 +88,9 @@ from torchtitan.models.deepseek_v3.model import Attention
 __all__ = [
     "MLAQRopeSelectiveAC",
     "MXFP8MLAQRopeAttention",
+    "MXFP8MLAQRopeTEAttention",
     "mxfp8_mla_q_rope",
+    "mxfp8_mla_q_rope_te_attn",
 ]
 
 _E4M3 = torch.float8_e4m3fn
@@ -197,6 +199,56 @@ class _MXFP8MLAQProjRope(torch.autograd.Function):
         return dx, dw, None, None, None, None
 
 
+class _MXFP8MLAQProjRopeCodes(torch.autograd.Function):
+    """Arm-E variant of :class:`_MXFP8MLAQProjRope`: same forward op and same
+    backward composition, but returns the RAW fp8 codes/scales (for a direct
+    MXFP8-attention consumer) plus an uninitialized BF16 host tensor that
+    exists only as the autograd edge -- its values are never read; TE's
+    MXFP8 attention consumes the codes, and dQ is routed back through the
+    host into the inverse-rope + MXFP8 dgrad/wgrad backward. This removes
+    the dequant bridge entirely."""
+
+    @staticmethod
+    def forward(ctx, x, w, cos, sin, cos32, sin32):
+        x_mx = _to_mx_dim0(x)
+        w_mx = _to_mx_dim0(w)
+        q_row_q, q_row_sf, q_col_q, q_col_sf = (
+            torch.ops.torchao.mxfp8_mla_q_proj_rope_cudnn(
+                x_mx.qdata,
+                w_mx.qdata,
+                cos,
+                sin,
+                x_mx.scale.view(torch.uint8),
+                w_mx.scale.view(torch.uint8),
+            )
+        )
+        host = q_row_q.new_empty(q_row_q.shape, dtype=torch.bfloat16)
+        ctx.save_for_backward(x, w, cos32, sin32)
+        ctx.mark_non_differentiable(q_row_q, q_row_sf, q_col_q, q_col_sf)
+        return host, q_row_q, q_row_sf, q_col_q, q_col_sf
+
+    @staticmethod
+    def backward(ctx, grad_host, *_unused):
+        dx, dw, *rest = _MXFP8MLAQProjRope.backward(ctx, grad_host)
+        return dx, dw, None, None, None, None
+
+
+class _STEToMX(torch.autograd.Function):
+    """Straight-through bridge: forward a pre-built MXFP8Tensor into TE's
+    attention; route its gradient back to the BF16 host (reshaped to the
+    host's layout). The TE#3330 STE convention, applied at the attention
+    boundary."""
+
+    @staticmethod
+    def forward(ctx, host, mx_tensor):
+        ctx.host_shape = host.shape
+        return mx_tensor
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.reshape(ctx.host_shape), None
+
+
 class MXFP8MLAQRopeAttention(Attention):
     """Stock DeepSeek-V3 attention with the fused MXFP8 Q-projection path."""
 
@@ -295,6 +347,169 @@ class MXFP8MLAQRopeAttention(Attention):
         return self.wo(output)
 
 
+class MXFP8MLAQRopeTEAttention(MXFP8MLAQRopeAttention):
+    """Arm E: the fused Q projection feeds TE's MXFP8 fused attention
+    directly (TE#2719) -- no dequant bridge, and the columnwise Q output
+    becomes the backward's dK operand instead of dead weight.
+
+    The flat token-major batch is viewed as ``bshd`` with
+    ``s = te_attn_seq_len`` (the recipe's max_context_length), attention is
+    plain causal PER WINDOW: packed documents inside one window may attend
+    across document boundaries, unlike the flex block mask. That is a
+    disclosed semantics delta of this arm (it also does MORE attention work
+    than the doc-masked baseline, never less). K/V are quantized at the
+    attention boundary (``mxfp8_quantize_only`` + one batched
+    ``mxfp8_transpose_swizzle`` with Q's wrapped codes); backward runs with
+    ``bf16_backward=True`` so dQ/dK/dV arrive in BF16 for the existing
+    inverse-rope / wkv autograd chain (STE through the attention-input
+    quantizes)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MXFP8MLAQRopeAttention.Config):
+        # Per-sequence window the flat batch is folded into (bshd); the
+        # flavor must set this to the recipe's max_context_length.
+        te_attn_seq_len: int = 4096
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.te_attn_seq_len = config.te_attn_seq_len
+        try:
+            import transformer_engine.pytorch as te
+            import transformer_engine_torch  # noqa: F401
+        except ImportError as exc:  # pragma: no cover - env-dependent
+            raise RuntimeError(
+                "MXFP8MLAQRopeTEAttention requires transformer_engine with "
+                "MXFP8 attention support (TE#2719, TE >= 2.2 dev with "
+                "cuDNN 9.21+); install it or use the non-TE override."
+            ) from exc
+        self._te = te
+        # Stored OUTSIDE the nn.Module registry (plain __dict__): TE's
+        # DotProductAttention is not a torchtitan-protocol Module and holds
+        # no parameters/buffers we need in the state dict, sharding walk, or
+        # trainer validation.
+        self.__dict__["te_dpa"] = te.DotProductAttention(
+            num_attention_heads=config.n_heads,
+            kv_channels=(
+                config.qk_nope_head_dim + config.qk_rope_head_dim,
+                config.v_head_dim,
+            ),
+            attention_dropout=0.0,
+            qkv_format="bshd",
+            softmax_scale=self.softmax_scale,
+        )
+
+    def _mxfp8_attention_inputs(self, q_parts, k, v, b, s):
+        """Wrap the fused op's Q codes + freshly quantized K/V into
+        attention-ready MXFP8Tensors (scale_inv permuted to BHSD, padded,
+        GEMM-swizzled -- the ``combine_and_quantize`` contract)."""
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            mxfp8_quantize_only,
+            mxfp8_transpose_swizzle,
+        )
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import (
+            MXFP8Quantizer,
+            MXFP8Tensor,
+        )
+
+        q_row, q_row_sf, q_col, q_col_sf = q_parts
+        nh = q_row.shape[1]
+        d = q_row.shape[2]
+        q_mx = MXFP8Tensor(
+            shape=(b, s, nh, d),
+            dtype=torch.bfloat16,
+            rowwise_data=q_row.view(torch.uint8).view(b, s, nh, d),
+            rowwise_scale_inv=q_row_sf.view(b, s, nh, d // _BLOCK),
+            columnwise_data=q_col.view(torch.uint8).view(b, s, nh, d),
+            columnwise_scale_inv=q_col_sf.view(b, s // _BLOCK, nh, d),
+            quantizer=MXFP8Quantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+            ),
+            requires_grad=False,
+            fp8_dtype=tex.DType.kFloat8E4M3,
+            with_gemm_swizzled_scales=False,
+        )
+        quantizers = [
+            MXFP8Quantizer(
+                fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+            )
+            for _ in range(2)
+        ]
+        k_mx, v_mx = mxfp8_quantize_only(
+            [(k.detach(), quantizers[0]), (v.detach(), quantizers[1])], "bshd"
+        )
+        mxfp8_transpose_swizzle([q_mx, k_mx, v_mx], "bshd")
+        return q_mx, k_mx, v_mx
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_masks: AttentionMasksType,
+        positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        num_tokens = x.shape[0]
+        s = self.te_attn_seq_len
+        if num_tokens % max(s, TOKEN_ALIGNMENT) != 0 or s % _BLOCK != 0:
+            raise RuntimeError(
+                "MXFP8MLAQRopeTEAttention requires the flattened token count "
+                f"to fold into [b, te_attn_seq_len={s}] windows (and s % "
+                f"{_BLOCK} == 0); got {num_tokens} tokens. Set "
+                "te_attn_seq_len to the recipe's max_context_length."
+            )
+        b = num_tokens // s
+
+        if self.q_lora_rank == 0:
+            q_in, w = x, self.wq.weight
+        else:
+            q_in = self.q_norm(self.wq_a(x))
+            w = self.wq_b.weight
+        if isinstance(w, DTensor):
+            raise RuntimeError(
+                "MXFP8MLAQRopeTEAttention does not support a tensor-parallel "
+                "Q projection; run with tensor_parallel_degree=1."
+            )
+
+        cache_c = self.rope._reshape_cache(
+            x.new_empty(num_tokens, 1, self.qk_rope_head_dim), positions
+        )
+        cos, sin, cos32, sin32 = _rope_tables(cache_c)
+
+        q_host, *q_parts = _MXFP8MLAQProjRopeCodes.apply(
+            q_in, w, cos, sin, cos32, sin32
+        )
+
+        # KV path: stock, with the k_pe halves permute (QK^T invariant).
+        kv = self.wkv_a(x)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = k_pe.unsqueeze(1)
+        k_pe = ComplexRoPE.apply_rotary_emb(k_pe, k_pe, cache_c)[0]
+        k_pe = torch.cat([k_pe[..., 0::2], k_pe[..., 1::2]], dim=-1)
+        kv = self.wkv_b(self.kv_norm(kv))
+        kv = kv.view(num_tokens, -1, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k = torch.cat([k_nope, k_pe.expand(-1, k_nope.size(1), -1)], dim=-1)
+
+        k4 = k.view(b, s, k.shape[1], k.shape[2]).contiguous()
+        v4 = v.reshape(b, s, v.shape[1], v.shape[2]).contiguous()
+        with torch.no_grad():
+            q_mx, k_mx, v_mx = self._mxfp8_attention_inputs(q_parts, k4, v4, b, s)
+
+        qb = _STEToMX.apply(q_host, q_mx)
+        kb = _STEToMX.apply(k4, k_mx)
+        vb = _STEToMX.apply(v4, v_mx)
+        with self._te.fp8_autocast(
+            enabled=True, fp8_recipe=self._te_recipe()
+        ):
+            out = self.te_dpa(qb, kb, vb, qkv_format="bshd", bf16_backward=True)
+        output = out.reshape(num_tokens, -1)
+        return self.wo(output)
+
+    def _te_recipe(self):
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        return MXFP8BlockScaling(fp8_dpa=True)
+
+
 class MLAQRopeSelectiveAC(SelectiveAC):
     """SelectiveAC that additionally saves the fused Q-projection composite.
 
@@ -366,3 +581,22 @@ def mxfp8_mla_q_rope(cfg: Attention.Config) -> MXFP8MLAQRopeAttention.Config:
             "(smaller counts produce numerically corrupt kernel output)."
         )
     return derive(cfg, MXFP8MLAQRopeAttention.Config)
+
+
+@override(
+    target=Attention.Config,
+    description=(
+        "Fused MXFP8 MLA Q-projection + RoPE feeding TE MXFP8 fused "
+        "attention directly (no dequant bridge; causal-per-window)."
+    ),
+)
+def mxfp8_mla_q_rope_te_attn(cfg: Attention.Config) -> MXFP8MLAQRopeTEAttention.Config:
+    base = mxfp8_mla_q_rope(cfg)
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+    except ImportError as exc:
+        raise ValueError(
+            "mxfp8_mla_q_rope_te_attn requires transformer_engine with MXFP8 "
+            "attention (TE#2719); install it or use mxfp8_mla_q_rope."
+        ) from exc
+    return derive(base, MXFP8MLAQRopeTEAttention.Config)
