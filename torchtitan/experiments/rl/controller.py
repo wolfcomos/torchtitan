@@ -1165,9 +1165,16 @@ class Controller(Configurable):
             # Save full training state for resume; CheckpointManager writes only on its interval
             # and the final step. After the divergence guard so a NaN step isn't checkpointed.
             with sl.log_trace_span("trainer_save_checkpoint"):
+                # An operator can force a save at the next step boundary
+                # (e.g. ahead of a cluster walltime limit) by touching
+                # SAVE_NOW in the dump folder; consumed once per touch.
+                save_now_marker = os.path.join(self.config.dump_folder, "SAVE_NOW")
+                save_now = os.path.exists(save_now_marker)
                 await self.trainer.save_checkpoint.call(
-                    step, last_step=(step == num_training_steps)
+                    step, last_step=(step == num_training_steps) or save_now
                 )
+                if save_now:
+                    os.remove(save_now_marker)
 
         # Finish the last in-flight sync so generators hold the final weights for post-validation.
         await self._weight_sync.wait_inflight_push_pull()
