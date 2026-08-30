@@ -379,6 +379,114 @@ def test_quantized_grouped_experts():
     assert hasattr(float8_cls.Config, "swiglu_limit")
 
 
+def test_mxfp8_backward_override_guard_on_older_torchao(monkeypatch):
+    """Building MXFP8 experts against a torchao whose MXFP8TrainingOpConfig
+    predates the backward_override field succeeds while the knob is unset, and
+    fails with an actionable error when the knob is set."""
+    pytest.importorskip("torchao")
+    import dataclasses
+
+    import torchao.prototype.moe_training.config as ao_config_mod
+
+    @dataclasses.dataclass
+    class OlderOpConfig:
+        # Deliberately no backward_override field, like released torchao.
+        @classmethod
+        def from_recipe(cls, recipe):
+            return cls()
+
+    monkeypatch.setattr(ao_config_mod, "MXFP8TrainingOpConfig", OlderOpConfig)
+
+    mxfp8_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts)
+    # The unset knob never touches the missing field, so the build succeeds.
+    module = mxfp8_cls.Config(dim=16, hidden_dim=32, num_experts=2).build()
+    assert isinstance(module._mxfp8_op_config, OlderOpConfig)
+    # "quantized" normalizes to the stock backward, so it works here too.
+    module = mxfp8_cls.Config(
+        dim=16, hidden_dim=32, num_experts=2, backward_override="quantized"
+    ).build()
+    assert isinstance(module._mxfp8_op_config, OlderOpConfig)
+    # An actual override cannot be honored by this torchao -> actionable error.
+    with pytest.raises(ValueError, match="does not support backward_override"):
+        mxfp8_cls.Config(
+            dim=16, hidden_dim=32, num_experts=2, backward_override="dequantized"
+        ).build()
+
+
+def test_mxfp8_grouped_converter_fqns_filtering(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.mx as mx_mod
+    from torchtitan.components.quantization import MXFP8GroupedExpertsConverter
+
+    monkeypatch.setattr(mx_mod, "has_cuda_capability", lambda *_: True)
+    mxfp8_config_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts).Config
+
+    config = ConfigManager().parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel"]
+    )
+    converter = MXFP8GroupedExpertsConverter(
+        MXFP8GroupedExpertsConverter.Config(fqns=["layers.1."])
+    )
+    model_config = converter.convert(config.model_spec.model)
+
+    converted_layers, stock_layers = set(), set()
+    for fqn, gc, _parent, _attr in model_config.traverse(GroupedExperts.Config):
+        layer = int(fqn.split(".")[1])
+        if isinstance(gc, mxfp8_config_cls):
+            converted_layers.add(layer)
+        else:
+            stock_layers.add(layer)
+    # The debugmodel has 6 layers with layer 0 dense: only the matched MoE
+    # layer converts, the other MoE layers stay stock.
+    assert converted_layers == {1}
+    assert stock_layers == {2, 3, 4, 5}
+
+    # An empty fqns list keeps the previous behavior: every GroupedExperts
+    # converts.
+    config = ConfigManager().parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel"]
+    )
+    converter = MXFP8GroupedExpertsConverter(MXFP8GroupedExpertsConverter.Config())
+    model_config = converter.convert(config.model_spec.model)
+    converted = [
+        gc
+        for _fqn, gc, _parent, _attr in model_config.traverse(GroupedExperts.Config)
+        if isinstance(gc, mxfp8_config_cls)
+    ]
+    assert len(converted) == 5
+
+
+def test_mxfp8_grouped_converter_backward_override_plumbs(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.mx as mx_mod
+    from torchtitan.components.quantization import MXFP8GroupedExpertsConverter
+
+    monkeypatch.setattr(mx_mod, "has_cuda_capability", lambda *_: True)
+
+    # Bad values are rejected at converter build, not on the first forward.
+    with pytest.raises(ValueError, match="backward_override"):
+        MXFP8GroupedExpertsConverter(
+            MXFP8GroupedExpertsConverter.Config(backward_override="bf16")
+        )
+
+    config = ConfigManager().parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel"]
+    )
+    converter = MXFP8GroupedExpertsConverter(
+        MXFP8GroupedExpertsConverter.Config(backward_override="dequantized")
+    )
+    model_config = converter.convert(config.model_spec.model)
+
+    mxfp8_config_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts).Config
+    converted = [
+        gc
+        for _fqn, gc, _parent, _attr in model_config.traverse(GroupedExperts.Config)
+        if isinstance(gc, mxfp8_config_cls)
+    ]
+    assert converted
+    assert all(gc.backward_override == "dequantized" for gc in converted)
+
+
 @pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
 def test_float8_grouped_experts_checkpoint_state_uses_plain_tensors(parent_cls):
     pytest.importorskip("torchao")
