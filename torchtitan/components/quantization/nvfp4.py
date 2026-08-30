@@ -28,10 +28,13 @@ from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.models.common.decoder_sharding import dense_activation_placement
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import LocalMapConfig
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
+
+from .utils import swap_token_dispatcher
 
 TP = MeshAxisName.TP
 
@@ -264,6 +267,31 @@ def nvfp4_bf16_tail_fqns(num_layers: int, bf16_tail_fraction: float) -> list[str
     return [f"layers.{i}." for i in range(convert_upto)]
 
 
+def nvfp4_bf16_first_last_fqns(
+    num_layers: int, num_start_layers_bf16: int, num_end_layers_bf16: int
+) -> list[str]:
+    """Converter ``fqns`` keeping the first ``num_start_layers_bf16`` and last
+    ``num_end_layers_bf16`` decoder layers in bf16 (the analog of
+    ``--first-last-layers-bf16`` in the miles RL framework's NVFP4 recipes,
+    https://github.com/radixark/miles).
+
+    Each fqn has a trailing '.' so 'layers.1.' matches layer 1 only, not
+    'layers.10' (the converters substring-match). Raises if the window would
+    leave no layer to convert: an empty fqns list would instead convert *all*
+    matching modules (the ``not fqns`` branch in convert), the opposite of the
+    intent.
+    """
+    convert_from = num_start_layers_bf16
+    convert_upto = num_layers - num_end_layers_bf16
+    if convert_from >= convert_upto:
+        raise ValueError(
+            f"num_start_layers_bf16={num_start_layers_bf16} and "
+            f"num_end_layers_bf16={num_end_layers_bf16} keep all {num_layers} "
+            "layers in bf16; nothing to convert to NVFP4."
+        )
+    return [f"layers.{i}." for i in range(convert_from, convert_upto)]
+
+
 def _validate_four_over_six_knobs(
     backward_override: str | None,
     weight_block: str,
@@ -271,15 +299,21 @@ def _validate_four_over_six_knobs(
     err_mode: str,
     e4m3_scale_bound: int,
     row_scaled_activation: bool = False,
+    grouped: bool = False,
 ) -> None:
     """Reject invalid four-over-six knob combinations at config time.
 
     Mirrors the TorchAO ops' runtime checks so a bad recipe fails when the
-    config tree is built rather than on the first forward. A row-scaled
-    four-over-six tensor has no columnwise form for the quantized wgrad
-    operand.
+    config tree is built rather than on the first forward. Grouped GEMMs have
+    no quantized backward (TransformerEngine rejects four-over-six group
+    quantization), and a row-scaled four-over-six tensor has no columnwise
+    form for the quantized wgrad operand.
     """
-    allowed = (None, "quantized", "high_precision", "dequantized")
+    allowed = (
+        (None, "high_precision", "dequantized")
+        if grouped
+        else (None, "quantized", "high_precision", "dequantized")
+    )
     if backward_override not in allowed:
         raise ValueError(
             f"backward_override must be one of {allowed}; got {backward_override!r}"
@@ -546,4 +580,229 @@ class NVFP4LinearConverter(QuantizationConverter):
                     setattr(parent, attr, new_config)
 
         logger.info("Converted Linear layers to NVFP4FourOverSixLinear")
+        return model_config
+
+
+try:
+    from torchao.prototype.moe_training.config import NVFP4FourOverSixTrainingOpConfig
+
+except ImportError:
+    NVFP4FourOverSixTrainingOpConfig = None
+
+
+_four_over_six_experts_cache: dict[type, type] = {}
+
+
+def _get_four_over_six_grouped_experts_cls(parent_cls: type) -> type:
+    """Get or create a four-over-six-quantized subclass of *parent_cls*.
+
+    Works for any experts module exposing the ``_grouped_mm`` seam (the common
+    ``GroupedExperts`` and ``GptOssGroupedExperts``), like
+    ``_get_mxfp8_grouped_experts_cls``. The returned class has a proper
+    ``_owner`` set by ``__init_subclass__``.
+
+    The subclass overrides ``_grouped_mm`` to call torchao's
+    ``_quantize_then_scaled_grouped_mm`` dispatcher with a
+    ``NVFP4FourOverSixTrainingOpConfig``, exactly like the MXFP8 analog.
+    Four-over-six needs no RHT sign vector and no stochastic-rounding seed,
+    so the stateless config carries everything.
+    """
+    if parent_cls in _four_over_six_experts_cache:
+        return _four_over_six_experts_cache[parent_cls]
+
+    parent_config_cls = parent_cls.Config  # type: ignore[attr-defined]
+
+    class FourOverSixGroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            err_mode: str = "mae"
+            e4m3_scale_bound: int = 256
+            row_scaled_activation: bool = False
+            backward_override: str | None = None
+            weight_block: str = "16x16"
+
+            def __post_init__(self) -> None:
+                # The grouped GEMM requires K % 128 == 0 and N % 128 == 0; both
+                # projections (dim x hidden_dim and hidden_dim x dim) hit both
+                # dims, so reject the model-dim violations up front here.
+                for name in ("dim", "hidden_dim"):
+                    value = getattr(self, name)
+                    if value % _NVFP4_BLOCK:
+                        raise ValueError(
+                            f"NVFP4 requires {name} divisible by {_NVFP4_BLOCK}; "
+                            f"got {name}={value}. NVFP4 cannot quantize these "
+                            "grouped experts; exclude them from the converter fqns."
+                        )
+                _validate_four_over_six_knobs(
+                    self.backward_override,
+                    self.weight_block,
+                    err_mode=self.err_mode,
+                    e4m3_scale_bound=self.e4m3_scale_bound,
+                    row_scaled_activation=self.row_scaled_activation,
+                    grouped=True,
+                )
+
+        def __init__(self, config: Config):
+            super().__init__(config)
+            # Import here rather than relying on the module-level probe so
+            # direct factory/config use (bypassing the converter) raises an
+            # actionable error instead of NoneType-not-callable, as in the
+            # MXFP8 analog.
+            try:
+                from torchao.prototype.moe_training.config import (
+                    NVFP4FourOverSixTrainingOpConfig,
+                )
+            except ImportError as e:
+                raise ImportError(
+                    "torchao is not installed or its grouped GEMM dispatcher "
+                    "does not support NVFP4 four-over-six. Install a torchao "
+                    "build with NVFP4FourOverSixTrainingOpConfig in "
+                    "torchao.prototype.moe_training.config."
+                ) from e
+            self._four_over_six_op_config = NVFP4FourOverSixTrainingOpConfig(
+                err_mode=config.err_mode,
+                e4m3_scale_bound=config.e4m3_scale_bound,
+                row_scaled_activation=config.row_scaled_activation,
+                weight_block=config.weight_block,
+                backward_override=config.backward_override,
+            )
+
+        def _grouped_mm(self, *, A, B_t, offs):
+            from torchao.prototype.moe_training.utils import (
+                _quantize_then_scaled_grouped_mm,
+            )
+
+            return _quantize_then_scaled_grouped_mm(
+                A, B_t, config=self._four_over_six_op_config, offs=offs
+            )
+
+    FourOverSixGroupedExperts.__name__ = f"NVFP4FourOverSix{parent_cls.__name__}"
+    FourOverSixGroupedExperts.__qualname__ = f"NVFP4FourOverSix{parent_cls.__name__}"
+    _four_over_six_experts_cache[parent_cls] = FourOverSixGroupedExperts
+    return FourOverSixGroupedExperts
+
+
+class NVFP4GroupedExpertsConverter(QuantizationConverter):
+    """Apply four-over-six NVFP4 quantization to MoE expert grouped GEMMs.
+
+    The miles NVFP4 RL recipes quantize only the routed-expert projections;
+    with no Linear converter alongside, this converter alone reproduces that
+    allow-list (attention, dense MLP, shared experts, router, embeddings, and
+    the LM head all stay bf16).
+
+    The row-scaled grouped forward loops dense GEMMs per token group with
+    host-read offsets, so it cannot be captured by torch.compile; combining
+    row_scaled_activation with model compile is rejected at config time (a
+    fused single-GEMM row-scaled variant is future work).
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(QuantizationConverter.Config):
+        fqns: list[str] = field(default_factory=list)
+        """
+        List of fully qualified names of modules to apply four-over-six NVFP4
+        quantization to. Only GroupedExperts.Config entries whose FQN contains
+        a match are converted. If empty, all GroupedExperts are converted.
+        """
+
+        recipe: str = "four_over_six"
+        """
+        NVFP4 grouped-experts recipe selector; 'four_over_six' is the only
+        supported value today -- torchao wires no RHT/SR grouped GEMM into
+        its dispatcher, so there is no 'default' grouped path.
+        """
+
+        err_mode: str = "mae"
+        """Candidate-selection error metric, 'mae' or 'mse'."""
+
+        e4m3_scale_bound: int = 256
+        """Global E4M3 scale bound; 256 leaves map-to-4 headroom."""
+
+        row_scaled_activation: bool = False
+        """One FP32 global scale per activation row instead of per token
+        group."""
+
+        backward_override: str | None = None
+        """'high_precision' (the default when None) or 'dequantized'; grouped
+        four-over-six has no quantized backward."""
+
+        weight_block: str = "16x16"
+        """Weight tile granularity; '1x16' mirrors
+        NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1."""
+
+        pad_multiple: int = 128
+        """
+        Pad per-expert token groups to this multiple for NVFP4 grouped GEMM
+        alignment (the four-over-six grouped GEMM requires 128-row groups).
+        """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+        if self.config.recipe != "four_over_six":
+            raise ValueError(
+                f"Unknown NVFP4 grouped-experts recipe {self.config.recipe!r}; "
+                "'four_over_six' is the only supported value today (torchao "
+                "wires no RHT/SR grouped GEMM into its dispatcher, so there "
+                "is no 'default' grouped path)."
+            )
+
+        if NVFP4FourOverSixTrainingOpConfig is None:
+            raise ImportError(
+                "torchao is not installed or its grouped GEMM dispatcher does "
+                "not support NVFP4 four-over-six. Install a torchao build with "
+                "NVFP4FourOverSixTrainingOpConfig in "
+                "torchao.prototype.moe_training.config."
+            )
+
+        if not has_cuda_capability(10, 0):
+            raise ValueError("NVFP4 is only supported on SM100 or later architectures")
+
+        if self.config.pad_multiple % _NVFP4_BLOCK:
+            raise ValueError(
+                f"pad_multiple must be a multiple of {_NVFP4_BLOCK}; got "
+                f"{self.config.pad_multiple}. The four-over-six grouped GEMM "
+                "requires 128-row-aligned token groups."
+            )
+
+        if self.config.model_compile_enabled:
+            raise ValueError(
+                "The four-over-six grouped-experts converter is eager-only: "
+                "torchao's grouped GEMM dispatcher host-reads offs[-1] to "
+                "slice over-allocated activations (and the row-scaled forward "
+                "additionally loops dense GEMMs per token group), which "
+                "torch.compile fullgraph capture cannot handle. Disable model "
+                "compile for the converted modules."
+            )
+
+    def convert(self, model_config):
+        assert NVFP4FourOverSixTrainingOpConfig is not None
+        fqns = self.config.fqns
+        for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+            if fqns and not any(target_fqn in fqn for target_fqn in fqns):
+                continue
+            # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
+            swap_token_dispatcher(parent, self.config.pad_multiple)
+            base_module_cls = type(config)._owner
+            quantized_cls = _get_four_over_six_grouped_experts_cls(base_module_cls)
+            config_cls = quantized_cls.Config  # type: ignore[attr-defined]
+            new_config = config_cls(
+                **{f.name: getattr(config, f.name) for f in fields(config)},
+                err_mode=self.config.err_mode,
+                e4m3_scale_bound=self.config.e4m3_scale_bound,
+                row_scaled_activation=self.config.row_scaled_activation,
+                backward_override=self.config.backward_override,
+                weight_block=self.config.weight_block,
+            )
+            if parent is None:
+                model_config = new_config
+            elif isinstance(parent, list):
+                parent[attr] = new_config
+            else:
+                setattr(parent, attr, new_config)
+
+        logger.info(
+            "Converted GroupedExperts to use dynamic NVFP4 four-over-six "
+            "quantization for grouped_mm ops"
+        )
         return model_config
