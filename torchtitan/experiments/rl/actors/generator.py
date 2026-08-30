@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import enum
 import gc
 import logging
@@ -942,7 +943,11 @@ class VLLMGenerator(Actor, Configurable):
 
         # --- Continuous-batching state (see the class docstring) ---
         self._rank = dist.get_rank()
-        self._broadcast_group = dist.new_group(backend="gloo")  # for LoopDecisions
+        # First-pass FA4 CuTe JIT compiles can stall a rank far beyond the
+        # 1800s gloo default while its peer waits in broadcast_object_list.
+        self._broadcast_group = dist.new_group(
+            backend="gloo", timeout=datetime.timedelta(seconds=7200)
+        )  # for LoopDecisions
         self._engine_loop_condition = (
             asyncio.Condition()
         )  # Signals to wake up when there is work

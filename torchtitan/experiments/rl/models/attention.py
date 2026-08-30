@@ -198,9 +198,10 @@ class PyTorchVarlenAttentionImpl(FlashAttentionImpl):
 
         assert self.alibi_slopes is None, "Alibi slopes not supported yet."
 
-        # FA3 can infer cu_seqlens_k from block_table + seqused_k.
+        # FA3/FA4 can infer cu_seqlens_k from block_table + seqused_k, and
+        # FA4 rejects an explicit cu_seqlens_k when block_table is given.
         # FA2 requires cu_seqlens_k to be explicitly set.
-        if current_flash_attention_impl() == "FA3":
+        if current_flash_attention_impl() in ("FA3", "FA4"):
             cu_seqlens_k = None
         else:
             num_seqs = seqused_k.shape[0]

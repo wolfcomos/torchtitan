@@ -437,8 +437,9 @@ class PolicyTrainer(Actor, Configurable):
         # TODO: Accept optional optimizer params (e.g. learning rate)
         # to allow controller-owned schedules.
 
-        # capture LR before step
-        current_lrs = self.lr_schedulers.schedulers[0].get_last_lr()
+        # capture LR before step; param groups that share a schedule (e.g. a
+        # weight-decay split) report one LR each, so collapse duplicates
+        current_lrs = sorted(set(self.lr_schedulers.schedulers[0].get_last_lr()))
         if len(current_lrs) != 1:
             raise ValueError(
                 "RL metrics only support a single optimizer LR for "
