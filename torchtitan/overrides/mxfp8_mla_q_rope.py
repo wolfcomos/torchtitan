@@ -52,26 +52,20 @@ from torch.distributed.tensor import DTensor
 # Importing the wrapper module registers the torchao:: custom op; the cudnn
 # package is only imported lazily inside the op body at first launch. The
 # module is newer than every torchao release, so its absence must surface as
-# the factory's actionable config-time error (with this reason), not an
-# ImportError at override-import time.
+# the factory's actionable config-time error, not an ImportError at
+# override-import time.
 try:
     from torchao.prototype.moe_training.kernels.mxfp8.cudnn_mla_q_proj_rope import (
         is_supported,
         QK_NOPE_HEAD_DIM,
         QK_ROPE_HEAD_DIM,
+        SCALE_BLOCK_SIZE as _BLOCK,
         TOKEN_ALIGNMENT,
     )
 except ImportError as _exc:
-    is_supported = None
-    _TORCHAO_MLA_Q_ROPE_OPS_AVAILABLE = False
-    _TORCHAO_MLA_Q_ROPE_UNAVAILABLE_REASON = (
-        "the installed torchao has no torchao.prototype.moe_training.kernels."
-        f"mxfp8.cudnn_mla_q_proj_rope module (a torchao build that ships the "
-        f"fused MLA Q-projection custom op is required): {_exc}"
-    )
+    _TORCHAO_IMPORT_ERROR = _exc
 else:
-    _TORCHAO_MLA_Q_ROPE_OPS_AVAILABLE = True
-    _TORCHAO_MLA_Q_ROPE_UNAVAILABLE_REASON = ""
+    _TORCHAO_IMPORT_ERROR = None
 import torchao.prototype.mx_formats.kernels  # noqa: F401  registers triton_mxfp8_dequant_dim0
 from torchao.prototype.mx_formats.config import (
     MXFP8Dim0CastKernelChoice,
@@ -95,7 +89,29 @@ __all__ = [
 ]
 
 _E4M3 = torch.float8_e4m3fn
-_BLOCK = 32
+
+
+def _to_mx_dim0(t: torch.Tensor) -> MXTensor:
+    return MXTensor.to_mx(
+        t,
+        _E4M3,
+        _BLOCK,
+        ScaleCalculationMode.RCEIL,
+        KernelPreference.AUTO,
+        mxfp8_dim0_cast_kernel_choice=MXFP8Dim0CastKernelChoice.TRITON,
+    )
+
+
+def _to_mx_dim1(t: torch.Tensor) -> MXTensor:
+    return _to_mxfp8_dim1_kernel_wrapper(
+        t,
+        _BLOCK,
+        _E4M3,
+        t.dtype,
+        KernelPreference.AUTO,
+        MXFP8Dim1CastKernelChoice.CUDA,
+        ScaleCalculationMode.RCEIL,
+    )
 
 
 def _rope_tables(cache_c: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -117,34 +133,13 @@ def _rope_tables(cache_c: torch.Tensor) -> tuple[torch.Tensor, ...]:
 
 
 class _MXFP8MLAQProjRope(torch.autograd.Function):
-    """wq GEMM + RoPE + dual MXFP8 quantize forward; MXFP8Linear-class backward.
-
-    Forward quantizes x and w rowwise exactly as ``mxfp8_linear.mx_mm`` does,
-    launches the fused kernel, and dequantizes the rowwise Q back to BF16 for
-    the BF16 inner attention (STE through that round trip). Backward
-    inverse-rotates the half-concatenated rotary-tail gradient back to the
-    interleaved pre-RoPE layout in fp32, then reproduces ``mx_mm.backward``'s
-    dgrad/wgrad composition (dim0 TRITON / dim1 CUDA casts, RCEIL) verbatim.
-    """
+    """wq GEMM + RoPE + dual MXFP8 quantize forward; MXFP8Linear-class
+    backward (dim0 TRITON / dim1 CUDA casts, RCEIL)."""
 
     @staticmethod
     def forward(ctx, x, w, cos, sin, cos32, sin32):
-        x_mx = MXTensor.to_mx(
-            x,
-            _E4M3,
-            _BLOCK,
-            ScaleCalculationMode.RCEIL,
-            KernelPreference.AUTO,
-            mxfp8_dim0_cast_kernel_choice=MXFP8Dim0CastKernelChoice.TRITON,
-        )
-        w_mx = MXTensor.to_mx(
-            w,
-            _E4M3,
-            _BLOCK,
-            ScaleCalculationMode.RCEIL,
-            KernelPreference.AUTO,
-            mxfp8_dim0_cast_kernel_choice=MXFP8Dim0CastKernelChoice.TRITON,
-        )
+        x_mx = _to_mx_dim0(x)
+        w_mx = _to_mx_dim0(w)
         q_row_q, q_row_sf, _q_col_q, _q_col_sf = (
             torch.ops.torchao.mxfp8_mla_q_proj_rope_cudnn(
                 x_mx.qdata,
@@ -155,8 +150,6 @@ class _MXFP8MLAQProjRope(torch.autograd.Function):
                 w_mx.scale.view(torch.uint8),
             )
         )
-        # The columnwise outputs are the FP8-attention-backward operands;
-        # torchtitan has no MXFP8 SDPA consumer, so they are dropped here.
         tokens, num_heads = q_row_q.shape[0], q_row_q.shape[1]
         q = torch.ops.torchao.triton_mxfp8_dequant_dim0(
             q_row_q,
@@ -190,43 +183,12 @@ class _MXFP8MLAQProjRope(torch.autograd.Function):
         )
 
         # From here this is mxfp8_linear.mx_mm.backward verbatim.
-        go_dim0 = MXTensor.to_mx(
-            dy,
-            _E4M3,
-            _BLOCK,
-            ScaleCalculationMode.RCEIL,
-            KernelPreference.AUTO,
-            mxfp8_dim0_cast_kernel_choice=MXFP8Dim0CastKernelChoice.TRITON,
-        )
-        w_dim1 = _to_mxfp8_dim1_kernel_wrapper(
-            w,
-            _BLOCK,
-            _E4M3,
-            w.dtype,
-            KernelPreference.AUTO,
-            MXFP8Dim1CastKernelChoice.CUDA,
-            ScaleCalculationMode.RCEIL,
-        )
+        go_dim0 = _to_mx_dim0(dy)
+        w_dim1 = _to_mx_dim1(w)
         dx = torch.mm(go_dim0, w_dim1.t())
 
-        go_dim1 = _to_mxfp8_dim1_kernel_wrapper(
-            dy,
-            _BLOCK,
-            _E4M3,
-            dy.dtype,
-            KernelPreference.AUTO,
-            MXFP8Dim1CastKernelChoice.CUDA,
-            ScaleCalculationMode.RCEIL,
-        )
-        x_t_dim0 = _to_mxfp8_dim1_kernel_wrapper(
-            x,
-            _BLOCK,
-            _E4M3,
-            x.dtype,
-            KernelPreference.AUTO,
-            MXFP8Dim1CastKernelChoice.CUDA,
-            ScaleCalculationMode.RCEIL,
-        ).t()
+        go_dim1 = _to_mx_dim1(dy)
+        x_t_dim0 = _to_mx_dim1(x).t()
         dw = torch.mm(go_dim1, x_t_dim0)
 
         return dx, dw, None, None, None, None
@@ -359,10 +321,13 @@ def mxfp8_mla_q_rope(cfg: Attention.Config) -> MXFP8MLAQRopeAttention.Config:
             "(the torchao op wraps the cudnn gemm_proj_rope_mxfp8_wrapper_sm100 "
             "kernel); remove the override or run on supported hardware."
         )
-    if not _TORCHAO_MLA_Q_ROPE_OPS_AVAILABLE:
+    if _TORCHAO_IMPORT_ERROR is not None:
         raise ValueError(
-            f"mxfp8_mla_q_rope: {_TORCHAO_MLA_Q_ROPE_UNAVAILABLE_REASON}"
-        )
+            "mxfp8_mla_q_rope: the installed torchao has no torchao.prototype."
+            "moe_training.kernels.mxfp8.cudnn_mla_q_proj_rope module (a "
+            "torchao build that ships the fused MLA Q-projection custom op is "
+            "required)."
+        ) from _TORCHAO_IMPORT_ERROR
     if type(cfg) is not Attention.Config:
         raise ValueError(
             "mxfp8_mla_q_rope targets the stock DeepSeek-V3 Attention.Config, "
@@ -389,6 +354,7 @@ def mxfp8_mla_q_rope(cfg: Attention.Config) -> MXFP8MLAQRopeAttention.Config:
             f"(qk_nope_head_dim={cfg.qk_nope_head_dim}, qk_rope_head_dim="
             f"{cfg.qk_rope_head_dim}, dim={cfg.dim}, n_heads={cfg.n_heads}); "
             "the kernel requires the fixed 128+64 head geometry, dim % 128 "
-            "== 0, and an even head count."
+            "== 0, and an even head count of at least 8 (smaller counts "
+            "produce numerically corrupt kernel output)."
         )
     return derive(cfg, MXFP8MLAQRopeAttention.Config)
