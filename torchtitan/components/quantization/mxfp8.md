@@ -116,6 +116,8 @@ model_spec = model_registry(
 
 * `recipe_name="mxfp8_rceil"`: MXFP8 dynamic quantization with RCEIL rounding mode for scale calculation.
 * `model_compile_enabled`: set to `True` when `torch.compile` is enabled for the model.
+* `fqns` (grouped converter): include-list of fully qualified module-name substrings to convert; empty converts every `GroupedExperts`.
+* `backward_override` (grouped converter): `None`/`"quantized"` keeps the quantized MXFP8 backward, `"high_precision"` computes gradients from the saved high-precision operands, `"dequantized"` computes them from the dequantized forward operands.
 
 **Important Notes:**
 

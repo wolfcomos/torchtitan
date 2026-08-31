@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from importlib.util import find_spec
 from typing import Literal
 
@@ -120,6 +120,7 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             recipe_name: str = "mxfp8_rceil"
+            backward_override: str | None = None
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -130,6 +131,26 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
 
             recipe = MXFP8TrainingRecipe(config.recipe_name)
             self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+            # None and "quantized" both keep the stock quantized backward, so
+            # normalize before probing: "quantized" then works on installed
+            # torchao builds that predate the backward_override knob, and
+            # replace() only runs when an actual override is set.
+            backward_override = config.backward_override
+            if backward_override == "quantized":
+                backward_override = None
+            if backward_override is not None:
+                if "backward_override" not in {
+                    f.name for f in fields(MXFP8TrainingOpConfig)
+                }:
+                    raise ValueError(
+                        "The installed torchao does not support backward_override "
+                        "for MXFP8 grouped GEMMs. Install a torchao build whose "
+                        "MXFP8TrainingOpConfig has the backward_override field."
+                    )
+                self._mxfp8_op_config = replace(
+                    self._mxfp8_op_config,
+                    backward_override=backward_override,
+                )
 
         def _grouped_mm(self, *, A, B_t, offs):
             from torchao.prototype.moe_training.utils import (
@@ -151,12 +172,28 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
 
     @dataclass(kw_only=True, slots=True)
     class Config(QuantizationConverter.Config):
+        fqns: list[str] = field(default_factory=list)
+        """
+        List of fully qualified names of modules to apply MXFP8 quantization to.
+        Only GroupedExperts.Config entries whose FQN contains a match are
+        converted. If empty, all GroupedExperts are converted.
+        """
+
         recipe_name: Literal["mxfp8_rceil"] = "mxfp8_rceil"
         """
         Quantization recipe name for grouped GEMMs. Options: ["mxfp8_rceil"]
 
         - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL rounding mode
           when computing the e8m0 scale factors.
+        """
+        backward_override: (
+            Literal["quantized", "high_precision", "dequantized"] | None
+        ) = None
+        """
+        Backward computation override for the grouped GEMMs. None or
+        "quantized" keeps the quantized MXFP8 backward, "high_precision"
+        computes gradients from the saved high-precision operands, and
+        "dequantized" computes them from the dequantized forward operands.
         """
         pad_multiple: int = 32
         """
@@ -175,6 +212,28 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         if not has_cuda_capability(10, 0):
             raise ValueError("MXFP8 is only supported on SM100 or later architectures")
 
+        allowed = (None, "quantized", "high_precision", "dequantized")
+        if self.config.backward_override not in allowed:
+            raise ValueError(
+                f"backward_override must be one of {allowed}; "
+                f"got {self.config.backward_override!r}"
+            )
+        # Fail fast at converter construction rather than deep inside model
+        # build: an actual override needs a torchao whose MXFP8TrainingOpConfig
+        # carries the knob ("quantized" normalizes to the stock backward and
+        # works on any torchao).
+        if self.config.backward_override not in (None, "quantized"):
+            from torchao.prototype.moe_training.config import MXFP8TrainingOpConfig
+
+            if "backward_override" not in {
+                f.name for f in fields(MXFP8TrainingOpConfig)
+            }:
+                raise ValueError(
+                    "The installed torchao does not support backward_override "
+                    "for MXFP8 grouped GEMMs. Install a torchao build whose "
+                    "MXFP8TrainingOpConfig has the backward_override field."
+                )
+
         if not self.config.model_compile_enabled:
             logger.warning(
                 "torch.compile enablement is required for highest performance "
@@ -182,7 +241,10 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             )
 
     def convert(self, model_config):
-        for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+        fqns = self.config.fqns
+        for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+            if fqns and not any(target_fqn in fqn for target_fqn in fqns):
+                continue
             # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
             swap_token_dispatcher(parent, self.config.pad_multiple)
             base_module_cls = type(config)._owner
@@ -191,6 +253,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
+                backward_override=self.config.backward_override,
             )
             if parent is None:
                 model_config = new_config
