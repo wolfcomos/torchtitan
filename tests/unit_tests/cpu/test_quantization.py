@@ -425,6 +425,74 @@ def test_float8_grouped_experts_dcp_round_trip_needs_no_safe_globals(tmp_path):
         torch.testing.assert_close(target_parameter, source_parameter)
 
 
+def test_nvfp4_bf16_first_last_fqns():
+    from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_first_last_fqns
+
+    # 6 layers, one bf16 layer at each end -> convert layers 1..4.
+    fqns = nvfp4_bf16_first_last_fqns(6, 1, 1)
+    assert fqns == [f"layers.{i}." for i in range(1, 5)]
+    # Every fqn is trailing-dot anchored so "layers.1." matches layer 1 only,
+    # not "layers.10".."layers.19" (the converters substring-match).
+    assert all(f.startswith("layers.") and f.endswith(".") for f in fqns)
+    # No exclusions -> every layer converted.
+    assert nvfp4_bf16_first_last_fqns(4, 0, 0) == [
+        "layers.0.",
+        "layers.1.",
+        "layers.2.",
+        "layers.3.",
+    ]
+    # A window that covers all layers leaves nothing to convert -> raise (an
+    # empty fqns list would instead convert *all* matching modules).
+    with pytest.raises(ValueError, match="nothing to convert"):
+        nvfp4_bf16_first_last_fqns(4, 2, 2)
+
+
+def _four_over_six_grouped_cls():
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    if nvfp4_mod.NVFP4FourOverSixTrainingOpConfig is None:
+        pytest.skip("torchao four-over-six grouped training prototype not available")
+    return nvfp4_mod._get_four_over_six_grouped_experts_cls
+
+
+def test_four_over_six_grouped_experts_cls():
+    """Four-over-six GroupedExperts factory: _owner, subclasses, knob fields."""
+    factory = _four_over_six_grouped_cls()
+
+    cls = factory(GroupedExperts)
+    assert cls.Config._owner is cls
+    assert issubclass(cls, GroupedExperts)
+    # Same class object on repeat calls (cached).
+    assert factory(GroupedExperts) is cls
+
+    gpt_oss_cls = factory(GptOssGroupedExperts)
+    assert gpt_oss_cls.Config._owner is gpt_oss_cls
+    assert issubclass(gpt_oss_cls, GptOssGroupedExperts)
+    assert hasattr(gpt_oss_cls.Config, "swiglu_limit")
+
+    config = cls.Config(
+        dim=256,
+        hidden_dim=128,
+        num_experts=2,
+        err_mode="mse",
+        e4m3_scale_bound=256,
+        row_scaled_activation=True,
+        backward_override="dequantized",
+        weight_block="1x16",
+    )
+    assert config.backward_override == "dequantized"
+
+    # The built module carries every knob into the grouped-GEMM op config.
+    module = config.build()
+    op_config = module._four_over_six_op_config
+    assert op_config.err_mode == "mse"
+    assert op_config.e4m3_scale_bound == 256
+    assert op_config.row_scaled_activation is True
+    assert op_config.weight_block == "1x16"
+    assert op_config.backward_override == "dequantized"
+
+
 def test_four_over_six_knob_validation():
     pytest.importorskip("torchao")
     from torchtitan.components.quantization import NVFP4FourOverSixLinear
@@ -458,6 +526,98 @@ def test_four_over_six_knob_validation():
             row_scaled_activation=True,
             backward_override="quantized",
         )
+
+
+def test_four_over_six_grouped_knob_validation():
+    """Split from the dense knob test: a torchao with only the dense
+    four-over-six prototype must not skip the dense assertions above."""
+    factory = _four_over_six_grouped_cls()
+    grouped_config_cls = factory(GroupedExperts).Config
+    # Grouped four-over-six has no quantized backward at all.
+    with pytest.raises(ValueError, match="backward_override"):
+        grouped_config_cls(
+            dim=256, hidden_dim=128, num_experts=2, backward_override="quantized"
+        )
+    # The grouped GEMM needs both projections' dims divisible by 128.
+    with pytest.raises(ValueError, match="divisible by 128"):
+        grouped_config_cls(dim=256, hidden_dim=96, num_experts=2)
+
+
+def _parse_recipe(monkeypatch, module, recipe):
+    # Exercise convert() targeting independent of GPU: bypass the sm100 gate
+    # (hardware is irrelevant to the config-tree transform under test).
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    config = ConfigManager().parse_args(["--module", module, "--config", recipe])
+    return config.model_spec.model
+
+
+def test_nvfp4_four_over_six_grouped_converter_targets_experts(monkeypatch):
+    factory = _four_over_six_grouped_cls()
+    from torchtitan.components.quantization import NVFP4FourOverSixLinear
+    from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
+
+    model_config = _parse_recipe(
+        monkeypatch, "deepseek_v3", "deepseek_v3_debugmodel_nvfp4_four_over_six"
+    )
+
+    grouped_config_cls = factory(GroupedExperts).Config
+    converted = [
+        (fqn, gc)
+        for fqn, gc, _parent, _attr in model_config.traverse(GroupedExperts.Config)
+    ]
+    # The debugmodel has 6 layers with layer 0 dense: every MoE layer converts.
+    assert len(converted) == 5
+    for fqn, gc in converted:
+        assert isinstance(gc, grouped_config_cls), fqn
+        # The miles base-recipe point plumbs through to every expert config.
+        assert gc.row_scaled_activation is True
+        assert gc.err_mode == "mse"
+        assert gc.e4m3_scale_bound == 256
+        assert gc.weight_block == "1x16"
+        assert gc.backward_override == "high_precision"
+
+    # Every token dispatcher on a converted MoE layer pads to 128 rows.
+    dispatchers = [
+        dc
+        for _fqn, dc, _parent, _attr in model_config.traverse(
+            TorchAOTokenDispatcher.Config
+        )
+    ]
+    assert len(dispatchers) == 5
+    assert all(dc.pad_multiple == 128 for dc in dispatchers)
+
+    # Experts-only allow-list: no dense Linear is quantized (attention, dense
+    # FFN, shared experts, router gate, and lm_head all stay stock).
+    if NVFP4FourOverSixLinear is not None:
+        for fqn, lc, _parent, _attr in model_config.traverse(Linear.Config):
+            assert not isinstance(lc, NVFP4FourOverSixLinear.Config), fqn
+
+
+def test_nvfp4_four_over_six_grouped_dequantized_keeps_first_last_bf16(monkeypatch):
+    factory = _four_over_six_grouped_cls()
+
+    model_config = _parse_recipe(
+        monkeypatch,
+        "deepseek_v3",
+        "deepseek_v3_debugmodel_nvfp4_four_over_six_dequantized",
+    )
+
+    grouped_config_cls = factory(GroupedExperts).Config
+    converted_layers, stock_layers = set(), set()
+    for fqn, gc, _parent, _attr in model_config.traverse(GroupedExperts.Config):
+        layer = int(fqn.split(".")[1])
+        if isinstance(gc, grouped_config_cls):
+            converted_layers.add(layer)
+            assert gc.backward_override == "dequantized"
+        else:
+            stock_layers.add(layer)
+
+    # 6 layers: layer 0 is dense (no experts), the first/last-bf16 window keeps
+    # layer 5 stock, so layers 1..4 convert.
+    assert converted_layers == {1, 2, 3, 4}
+    assert stock_layers == {5}
 
 
 def test_nvfp4_four_over_six_linear_converter_plumbs_new_knobs(monkeypatch):
@@ -544,3 +704,77 @@ def test_nvfp4_converter_default_recipe_rejects_four_over_six_knobs(monkeypatch)
         )
     # Knobs left at their defaults stay accepted under recipe='default'.
     NVFP4LinearConverter(NVFP4LinearConverter.Config(err_mode="mae"))
+
+
+def test_four_over_six_grouped_converter_rejects_compile(monkeypatch):
+    _four_over_six_grouped_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # torchao's dispatcher branch host-reads offs[-1] in every configuration,
+    # which fullgraph compile cannot capture -> rejected at config time.
+    with pytest.raises(ValueError, match="eager-only"):
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(
+                model_compile_enabled=True,
+            )
+        )
+    with pytest.raises(ValueError, match="eager-only"):
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(
+                model_compile_enabled=True,
+                row_scaled_activation=True,
+            )
+        )
+    # Row-scaling alone (eager) stays accepted.
+    NVFP4GroupedExpertsConverter(
+        NVFP4GroupedExpertsConverter.Config(
+            row_scaled_activation=True,
+        )
+    )
+
+
+def test_four_over_six_grouped_converter_rejects_bad_pad_multiple(monkeypatch):
+    _four_over_six_grouped_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # The four-over-six grouped GEMM requires 128-row-aligned token groups, so
+    # a dispatcher pad that is not a multiple of 128 is rejected at converter
+    # build rather than producing silently wrong numerics on the first forward.
+    with pytest.raises(ValueError, match="multiple of 128"):
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(pad_multiple=64)
+        )
+
+
+def test_nvfp4_grouped_converter_rejects_non_four_over_six_recipes(monkeypatch):
+    _four_over_six_grouped_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+    from torchtitan.components.quantization import NVFP4GroupedExpertsConverter
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    # torchao wires no RHT/SR grouped GEMM into its dispatcher, so there is no
+    # 'default' grouped path: 'four_over_six' is the only supported recipe.
+    with pytest.raises(ValueError, match="only supported value"):
+        NVFP4GroupedExpertsConverter(
+            NVFP4GroupedExpertsConverter.Config(recipe="default")
+        )
+    with pytest.raises(ValueError, match="only supported value"):
+        NVFP4GroupedExpertsConverter(NVFP4GroupedExpertsConverter.Config(recipe="rht"))
+
+
+def test_has_quantization_counts_four_over_six_experts(monkeypatch):
+    _four_over_six_grouped_cls()
+
+    stock = ConfigManager().parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel"]
+    )
+    assert not has_quantization(stock.model_spec.model)
+
+    grouped = _parse_recipe(
+        monkeypatch, "deepseek_v3", "deepseek_v3_debugmodel_nvfp4_four_over_six"
+    )
+    assert has_quantization(grouped)
