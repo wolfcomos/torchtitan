@@ -349,8 +349,10 @@ class MXFP8MLAQRopeAttention(Attention):
 
 class MXFP8MLAQRopeTEAttention(MXFP8MLAQRopeAttention):
     """Arm E: the fused Q projection feeds TE's MXFP8 fused attention
-    directly (TE#2719) -- no dequant bridge, and the columnwise Q output
-    becomes the backward's dK operand instead of dead weight.
+    directly (TE#2719): the rowwise codes enter attention as MXFP8 with no
+    dequant bridge. The columnwise codes are NOT load-bearing here -- this
+    arm runs ``bf16_backward=True``, so nothing consumes them as the
+    ``dK = dS^T . Q`` operand; that needs an fp8 backward.
 
     The flat token-major batch is viewed as ``bshd`` with
     ``s = te_attn_seq_len`` (the recipe's max_context_length), attention is
