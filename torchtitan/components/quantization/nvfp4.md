@@ -115,6 +115,41 @@ GiB (30%) less peak reserved memory. It was 3% slower than MXFP8 while using
 
 *Qwen3 8B random-initialization training loss through 200M tokens at global batch size 64.*
 
+### Four-over-six Recipe
+
+`NVFP4LinearConverter` selects between two NVFP4 recipes with its `recipe`
+knob. `recipe="default"` keeps torchao's NVFP4 recipe described above —
+random Hadamard transform plus stochastic rounding, with stateful per-rank
+module buffers (the RHT sign vector and the stochastic-rounding seed).
+`recipe="four_over_six"` applies the stateless NVFP4 four-over-six training
+recipe from `torchao.prototype.moe_training.nvfp4_training.four_over_six`:
+each 16-value
+FP4 block is quantized twice — once with the standard map-to-6 block scale
+and once with a 1.5x-expanded map-to-4 scale — and the candidate with the
+lower dequantization error is kept. Four-over-six uses no random Hadamard
+transform and no stochastic rounding; it targets reinforcement learning and
+other post-training workloads.
+
+The remaining converter knobs are read only under `recipe="four_over_six"`;
+a non-default value under `recipe="default"` is rejected at converter build
+rather than silently ignored:
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `err_mode` | `"mae"` | Candidate-selection error metric, `"mae"` or `"mse"`. |
+| `e4m3_scale_bound` | `256` | Global E4M3 scale bound; 256 leaves map-to-4 headroom, 448 uses the full E4M3 range. |
+| `row_scaled_activation` | `False` | One FP32 global scale per activation row instead of per tensor; selects the bf16 backward. |
+| `backward_override` | `None` | `"quantized"`, `"high_precision"`, or `"dequantized"`, mirroring TransformerEngine's `NVTE_BACKWARD_OVERRIDE`. |
+| `weight_block` | `"16x16"` | Weight tile granularity; `"1x16"` mirrors `NVTE_NVFP4_DISABLE_2D_QUANTIZATION=1`. |
+
+Invalid knob combinations are rejected when the config tree is built rather
+than on the first forward.
+
+The `llama3_debugmodel_nvfp4_four_over_six` recipe converts every in-layer
+Linear via `fqns=["layers"]` and keeps the LM head in bf16. Like the default
+recipe, local GEMM dimensions must be divisible by 128, and SM100 or later is
+required.
+
 ### Versioned Environment
 
 The Llama results and instructions use the container's current upstream builds:
