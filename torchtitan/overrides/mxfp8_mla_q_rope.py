@@ -350,9 +350,20 @@ class MXFP8MLAQRopeAttention(Attention):
 class MXFP8MLAQRopeTEAttention(MXFP8MLAQRopeAttention):
     """Arm E: the fused Q projection feeds TE's MXFP8 fused attention
     directly (TE#2719): the rowwise codes enter attention as MXFP8 with no
-    dequant bridge. The columnwise codes are NOT load-bearing here -- this
-    arm runs ``bf16_backward=True``, so nothing consumes them as the
-    ``dK = dS^T . Q`` operand; that needs an fp8 backward.
+    dequant bridge, and the columnwise codes become the backward's
+    ``dK = dS^T . Q`` operand instead of dead weight.
+
+    ``bf16_backward=True`` does NOT make the attention backward BF16 -- it
+    only suppresses re-quantizing dQ/dK/dV into MXFP8Tensors on the way out
+    (TE backends.py consumes the flag only AFTER ``fused_attn_bwd`` has
+    returned). The backward still runs cuDNN's FP8 SDPA node and consumes
+    rowwise Q/K/V plus COLUMNWISE Q and K. Measured on GB200 (TE 2.20.0.dev0,
+    cuDNN 9.26) at this geometry: substituting only the columnwise half of Q
+    with a quantization of ``alpha * Q`` scales dK by exactly alpha, while
+    the forward output, dQ and dV stay BITWISE identical -- so a bug in the
+    fused op's columnwise codes yields a wrong dK behind a bit-exact forward.
+    (The one switch that really does force a BF16 backward is the
+    ``NVTE_FP8_DPA_BWD=0`` env var, default "1".)
 
     The flat token-major batch is viewed as ``bshd`` with
     ``s = te_attn_seq_len`` (the recipe's max_context_length), attention is
@@ -519,8 +530,9 @@ class MLAQRopeSelectiveAC(SelectiveAC):
     save set, so stock ``SelectiveAC`` recomputes the whole Q composite in
     backward -- two fused-kernel launches (and two wrapper CPU enqueues) per
     layer-step. Saving both ops' outputs trades memory (the op's fp8
-    codes/scales, including the currently-unused columnwise pair, plus the
-    BF16 dequantized Q) for that recompute. The stock every-second-matmul
+    codes/scales for both layouts -- the columnwise pair is dead weight for
+    the flex-attention arm but is the dK operand for the TE-attention arm --
+    plus the BF16 dequantized Q) for that recompute. The stock every-second-matmul
     policy is untouched.
     """
 
