@@ -12,6 +12,7 @@ import gc
 import logging
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -154,9 +155,9 @@ def _prepare_generation_request_metrics(
                 inputs.last_token_ts - inputs.first_token_ts
             ) * 1000
             metric_values[f"{prefix}/decode_time_ms"] = first_to_last_token_ms
-            metric_values[
-                f"{prefix}/inter_token_latency_ms"
-            ] = first_to_last_token_ms / (inputs.num_generation_tokens - 1)
+            metric_values[f"{prefix}/inter_token_latency_ms"] = (
+                first_to_last_token_ms / (inputs.num_generation_tokens - 1)
+            )
 
     # Emit each value with both Mean and Max aggregators.
     return [
@@ -1305,9 +1306,9 @@ class VLLMGenerator(Actor, Configurable):
         self._rank0_check_engine_loop_running("pull_model_state_dict")
 
         # A placeholder future for the engine loop to resolve once the pull has been applied.
-        pull_model_state_dict_future: asyncio.Future[
-            int
-        ] = asyncio.get_running_loop().create_future()
+        pull_model_state_dict_future: asyncio.Future[int] = (
+            asyncio.get_running_loop().create_future()
+        )
 
         # `_engine_loop_condition` wakes the engine loop, if asleep, when a pull is queued.
         async with self._engine_loop_condition:
@@ -1329,6 +1330,7 @@ class VLLMGenerator(Actor, Configurable):
         # live trainer GPU tensors while optimizer steps may be mutating them.
         model = self._get_model()
         model_sd = model.model.state_dict()
+        pull_start = time.perf_counter()
         if get_spmd_backend() == "spmd_types":
             await self._get_spmd_state_dict(model_sd, model=model)
         else:
@@ -1338,6 +1340,7 @@ class VLLMGenerator(Actor, Configurable):
                 strict=False,
                 direct_rdma=False,
             )
+        self._log_pull_throughput(model_sd, time.perf_counter() - pull_start)
         # state_dict() returns hook-produced copies for fused modules (e.g.
         # FusedQKVLinear's wqkv -> wq/wk/wv), so the in-place fill above never
         # reaches the real param. Re-apply via load_state_dict to run the merge hook.
@@ -1362,6 +1365,34 @@ class VLLMGenerator(Actor, Configurable):
             self._pull_model_state_dict_future.set_result(version)
             self._pull_model_state_dict_future = None
             self._model_state_dict_pull_request = None
+
+    def _log_pull_throughput(self, model_sd: dict, elapsed_s: float) -> None:
+        """Record how many bytes this rank pulled and the effective bandwidth.
+
+        Cross-node this is the number to watch: the pull rides whatever
+        network path the trainer and generator hosts resolve each other on,
+        and a slow path (e.g. a 1 GbE management NIC picked up through the
+        hostname) shows up here as a bandwidth an order of magnitude below
+        the fabric's, long before it is visible in the step timings.
+        """
+        num_bytes = sum(
+            t.numel() * t.element_size()
+            for t in model_sd.values()
+            if isinstance(t, torch.Tensor)
+        )
+        gib = num_bytes / 2**30
+        gib_per_s = gib / elapsed_s if elapsed_s > 0 else 0.0
+        sl.log_trace_scalar(
+            {
+                "weight_sync/pull_gib": gib,
+                "weight_sync/pull_seconds": elapsed_s,
+                "weight_sync/pull_gib_per_s": gib_per_s,
+            }
+        )
+        logger.info(
+            f"[rank {self._rank}] weight pull: {gib:.2f} GiB in {elapsed_s:.1f}s "
+            f"({gib_per_s:.2f} GiB/s)"
+        )
 
     async def _get_spmd_state_dict(self, model_sd: dict, *, model) -> None:
         """Fetch trainer-pushed weights into a spmd_types generator state dict.
