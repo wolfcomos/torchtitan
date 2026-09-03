@@ -160,7 +160,16 @@ def _host_meshes_from_env(num_generators: int) -> HostMeshes | None:
     addrs = os.environ.get("RL_GENERATOR_WORKER_ADDRS")
     if not addrs:
         return None
+    from monarch._src.actor.actor_mesh import enable_transport
     from monarch._src.actor.bootstrap import attach_to_workers
+
+    # The default client transport is unix-domain, whose reply address a
+    # remote worker cannot dial back; cross-node attach needs the client on
+    # tcp. Must run before any other monarch call. The advertised tcp
+    # hostname must resolve to a routable IP on every node — containers
+    # whose /etc/hosts maps the node's own name to 127.0.1.1 need a
+    # corrected hosts file mounted in.
+    enable_transport("tcp")
 
     addr_list = [a for a in addrs.split(",") if a]
     assert len(addr_list) == num_generators, (
