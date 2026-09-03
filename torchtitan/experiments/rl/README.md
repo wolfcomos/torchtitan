@@ -190,6 +190,8 @@ Reference recipes enable W&B by default. Run `wandb login` before launch, or pas
 
 ## Monarch specifics
 
+Generators can run on other hosts; see the [multi-node guide](./docs/multi_node.md) for the worker, the env vars, and how to keep the weight sync off the management NIC.
+
 ### Actor endpoints use `@concurrent_endpoint`
 
 **Every endpoint on a Monarch actor, e.g. `PolicyTrainer`, `VLLMGenerator`, and so on, is declared with `@concurrent_endpoint`, not `@endpoint`.** New endpoints follow the same rule.
