@@ -42,9 +42,12 @@ class _CyclingDataset(Configurable):
         *,
         seed: int,
         shuffle: bool,
+        skip: int = 0,
     ) -> None:
         if not samples:
             raise ValueError("math dataset must contain at least one sample")
+        if skip < 0:
+            raise ValueError(f"skip must be >= 0, got {skip}")
         self._samples = samples
         self._rng = random.Random(seed)
         self._shuffle = shuffle
@@ -52,6 +55,12 @@ class _CyclingDataset(Configurable):
         if shuffle:
             self._rng.shuffle(self._order)
         self._position = 0
+        # The controller does not restore the stream position on resume (see TODO(resume) in
+        # controller.py), so a chained run re-reads the same prompts after every restart. The
+        # stream is deterministic given `seed`, so advancing it by `skip` samples puts a resumed
+        # window exactly where an uninterrupted run would be (skip = prompts_per_step * resume_step).
+        for _ in range(skip):
+            next(self)
 
     def __iter__(self) -> Iterator[DapoMathSample]:
         return self
@@ -91,6 +100,12 @@ class DapoMathDataset(_CyclingDataset):
         split: str = "train"
         seed: int = 42
         shuffle: bool = True
+        skip: int = 0
+        """
+        Number of samples to skip at the start of the (seeded) stream. Set to
+        num_prompts_per_train_step * resume_step when resuming a chained run so the
+        data stream continues instead of restarting from the first prompt.
+        """
 
     def __init__(self, config: Config) -> None:
         dataset = load_dataset(config.repo_id, split=config.split)
@@ -106,7 +121,9 @@ class DapoMathDataset(_CyclingDataset):
                     ground_truth=str(row["ground_truth"]),
                 )
             )
-        super().__init__(samples, seed=config.seed, shuffle=config.shuffle)
+        super().__init__(
+            samples, seed=config.seed, shuffle=config.shuffle, skip=config.skip
+        )
 
 
 class AIME2025Dataset(_CyclingDataset):
