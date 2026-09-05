@@ -57,6 +57,18 @@ def test_dapo_dataset_is_deterministic_and_resumable(monkeypatch) -> None:
     assert [next(resumed) for _ in range(3)] == expected
 
 
+def test_dapo_dataset_skip_continues_the_stream(monkeypatch) -> None:
+    # A resumed run does not restore the stream position (see TODO(resume) in
+    # controller.py); `skip` must land exactly where an uninterrupted run would be,
+    # including across the epoch boundary where the training stream reshuffles.
+    monkeypatch.setattr(math_data, "load_dataset", lambda *args, **kwargs: _dapo_rows())
+    uninterrupted = DapoMathDataset.Config(seed=7).build()
+    stream = [next(uninterrupted) for _ in range(8)]
+    for skip in (0, 2, 3, 7):
+        resumed = DapoMathDataset.Config(seed=7, skip=skip).build()
+        assert [next(resumed) for _ in range(8 - skip)] == stream[skip:]
+
+
 def test_aime_dataset_combines_both_subsets(monkeypatch) -> None:
     def load_dataset(repo_id, subset, *, split):
         del repo_id, split
