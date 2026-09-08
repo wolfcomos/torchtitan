@@ -5,12 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field, fields
+from importlib import import_module
 from importlib.util import find_spec
 from typing import Literal
+
+import torch
 
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
@@ -30,6 +34,51 @@ try:
 except ImportError as import_error:
     MXFP8Linear = None
     _mxfp8_linear_import_error = import_error
+
+
+FusionPlan = Literal["none", "swiglu", "grouped_gemm_swiglu"]
+_FUSION_PLANS = ("none", "swiglu", "grouped_gemm_swiglu")
+# Contract of the fused plans (implemented in grouped_experts.py): every
+# expert's token group is zero-padded to this many rows by the token
+# dispatcher, and the expert dimensions are multiples of the kernels' tile.
+_FUSION_PLAN_PAD_MULTIPLES = {"swiglu": 128, "grouped_gemm_swiglu": 256}
+_FUSED_DIM_ALIGNMENT = 128
+# The torchao kernel module (under moe_training.kernels.mxfp8) each fused plan
+# runs on and the PR that added it.
+_FUSION_PLAN_KERNELS = {
+    "swiglu": ("cutedsl_gated_act_mxfp8", "pytorch/ao#4743"),
+    "grouped_gemm_swiglu": ("cudnn_grouped_mlp", "pytorch/ao#4820"),
+}
+
+
+def _import_fusion_plan_kernels(fusion_plan: str) -> None:
+    """Import what a fused plan runs on, so a torchao that predates the plan's
+    kernels or a missing runtime package fails at converter construction
+    rather than at the first expert forward.
+    """
+    kernels, pull_request = _FUSION_PLAN_KERNELS[fusion_plan]
+    try:
+        import_module(f"torchao.prototype.moe_training.kernels.mxfp8.{kernels}")
+        if fusion_plan == "grouped_gemm_swiglu":
+            # torchao's cuDNN ops import their runtime lazily at first launch.
+            import_module("cudnn")
+        from . import grouped_experts  # noqa: F401
+
+    except ImportError as import_error:
+        missing = import_error.name or ""
+        if missing.startswith("torchao"):
+            reason = (
+                f"needs torchao's {kernels} kernels, added in {pull_request} and "
+                "not in any torchao release; install a torchao that contains them"
+            )
+        else:
+            reason = (
+                f"could not import {missing!r}, a runtime the {kernels} kernels need"
+            )
+        raise ImportError(
+            f"MXFP8 fusion_plan={fusion_plan!r} {reason} (the chained error "
+            "names what failed to import)."
+        ) from import_error
 
 
 class MXFP8LinearConverter(QuantizationConverter):
@@ -158,7 +207,9 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
     proper ``_owner`` set by ``__init_subclass__``.
 
     The subclass overrides ``_grouped_mm`` to call torchao's
-    ``_quantize_then_scaled_grouped_mm``.
+    ``_quantize_then_scaled_grouped_mm``. With a ``fusion_plan`` other than
+    ``"none"`` it also overrides the ``_grouped_mlp`` seam so the whole expert
+    MLP runs as one fused composite (``GroupedExperts`` parents only).
     """
     if parent_cls in _mxfp8_experts_cache:
         return _mxfp8_experts_cache[parent_cls]
@@ -169,6 +220,42 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             recipe_name: str = "mxfp8_rceil"
+            fusion_plan: FusionPlan = "none"
+
+            def __post_init__(self) -> None:
+                if self.fusion_plan not in _FUSION_PLANS:
+                    raise ValueError(
+                        f"MXFP8 fusion_plan must be one of {_FUSION_PLANS}; got "
+                        f"{self.fusion_plan!r}."
+                    )
+                if self.fusion_plan == "none":
+                    return
+                # The fused kernels quantize with RCEIL scales internally.
+                if self.recipe_name != "mxfp8_rceil":
+                    raise ValueError(
+                        f"MXFP8 fusion_plan={self.fusion_plan!r} supports only "
+                        f"recipe_name='mxfp8_rceil'; got {self.recipe_name!r}."
+                    )
+                # The fused composites implement the stock SwiGLU MLP; other
+                # experts modules (GptOssGroupedExperts: biases, clamped SwiGLU)
+                # keep the per-GEMM quantization.
+                if parent_cls is not GroupedExperts:
+                    raise ValueError(
+                        f"MXFP8 fusion_plan={self.fusion_plan!r} supports only "
+                        f"GroupedExperts, not {parent_cls.__name__}; use "
+                        "fusion_plan='none' for this model."
+                    )
+                # dim / hidden_dim are known at config-build time (the TP degree
+                # is not); the composite re-checks the per-rank local dims.
+                for name in ("dim", "hidden_dim"):
+                    value = getattr(self, name)
+                    if value % _FUSED_DIM_ALIGNMENT:
+                        raise ValueError(
+                            f"MXFP8 fusion_plan={self.fusion_plan!r} requires "
+                            f"{name} divisible by {_FUSED_DIM_ALIGNMENT}; got "
+                            f"{name}={value}. Use fusion_plan='none' for this "
+                            "model."
+                        )
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -179,6 +266,42 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
 
             recipe = MXFP8TrainingRecipe(config.recipe_name)
             self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+            self.fusion_plan = config.fusion_plan
+
+        def _grouped_mlp(self, *, x_RD, w1_EFD, w2_EDF, w3_EFD, offsets_E):
+            if self.fusion_plan == "none":
+                return super()._grouped_mlp(
+                    x_RD=x_RD,
+                    w1_EFD=w1_EFD,
+                    w2_EDF=w2_EDF,
+                    w3_EFD=w3_EFD,
+                    offsets_E=offsets_E,
+                )
+            from . import grouped_experts
+
+            # Casts stay outside the composites so autograd covers high-precision
+            # master weights; the packed gate/up operand is a differentiable copy
+            # of the stock parameters.
+            x_RD = x_RD.bfloat16()
+            w1_EFD, w2_EDF, w3_EFD = (
+                w1_EFD.bfloat16(),
+                w2_EDF.bfloat16(),
+                w3_EFD.bfloat16(),
+            )
+            if self.fusion_plan == "swiglu":
+                w13_E2FD = torch.cat([w1_EFD, w3_EFD], dim=1)
+                w2_t_EFD = w2_EDF.transpose(-2, -1)
+                grouped_experts._validate_swiglu_inputs(x_RD, w1_EFD, w2_t_EFD)
+                return grouped_experts._MXFP8SwiGLUFusionFunction.apply(
+                    x_RD, w13_E2FD, w2_t_EFD, offsets_E
+                )
+            grouped_experts._validate_grouped_gemm_inputs(x_RD, w1_EFD)
+            return grouped_experts._MXFP8GroupedGemmSwiGLUFusionFunction.apply(
+                x_RD,
+                grouped_experts._pack_w13_blocks(w1_EFD, w3_EFD),
+                w2_EDF,
+                offsets_E,
+            )
 
         def _grouped_mm(self, *, A, weight_EOI, offs):
             from torchao.prototype.moe_training.utils import (
@@ -215,6 +338,41 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         Pad per-expert token groups to this multiple for MXFP8 grouped GEMM alignment.
         The CuTeDSL quantization kernel on sm_100 requires multiples of 128.
         """
+        fusion_plan: FusionPlan = "none"
+        """
+        Which part of the expert SwiGLU MLP runs as one fused torchao kernel.
+
+        - none: three separately quantized grouped GEMMs with the SwiGLU in
+          BF16 between them.
+        - swiglu: the two grouped GEMMs stay separate; the SwiGLU and both MXFP8
+          quantizations of its output (rowwise for the down GEMM, columnwise for
+          the down weight gradient) run in one CuTeDSL kernel (torchao
+          ``cutedsl_gated_act_mxfp8``, pytorch/ao#4743). Requires ``pad_multiple``
+          a multiple of 128 and ``dim`` / ``hidden_dim`` multiples of 128.
+        - grouped_gemm_swiglu: grouped GEMM, SwiGLU and MXFP8 quantization fused
+          in one cuDNN kernel per direction (torchao ``cudnn_grouped_mlp`` ops,
+          pytorch/ao#4820). Requires ``pad_multiple`` a multiple of 256 (the
+          kernels' fixed group padding) and ``dim`` / ``hidden_dim`` multiples
+          of 128.
+
+        Both fused plans support only the stock ``GroupedExperts`` and raise at
+        config time otherwise; there is no silent fallback.
+        """
+
+        def __post_init__(self) -> None:
+            if self.fusion_plan not in _FUSION_PLANS:
+                raise ValueError(
+                    f"MXFP8 fusion_plan must be one of {_FUSION_PLANS}; got "
+                    f"{self.fusion_plan!r}."
+                )
+            if self.fusion_plan != "none" and (
+                self.pad_multiple % _FUSION_PLAN_PAD_MULTIPLES[self.fusion_plan]
+            ):
+                raise ValueError(
+                    f"MXFP8 fusion_plan={self.fusion_plan!r} requires pad_multiple "
+                    f"to be a multiple of {_FUSION_PLAN_PAD_MULTIPLES[self.fusion_plan]}"
+                    f"; got {self.pad_multiple}."
+                )
 
     def __init__(self, config: Config):
         self.config = config
@@ -227,6 +385,19 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         if not has_cuda_capability(10, 0):
             raise ValueError("MXFP8 is only supported on SM100 or later architectures")
 
+        if self.config.fusion_plan != "none":
+            _import_fusion_plan_kernels(self.config.fusion_plan)
+        if (
+            self.config.fusion_plan == "grouped_gemm_swiglu"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() != (10, 0)
+        ):
+            # The cuDNN grouped-MLP wrappers are built for SM 10.0 only.
+            raise ValueError(
+                "MXFP8 fusion_plan='grouped_gemm_swiglu' runs only on SM 10.0 "
+                f"GPUs; got {torch.cuda.get_device_capability()}."
+            )
+
         if not self.config.model_compile_enabled:
             logger.warning(
                 "torch.compile enablement is required for highest performance "
@@ -234,8 +405,19 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             )
 
     def convert(self, model_config):
-        for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+        for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
             # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
+            if self.config.fusion_plan != "none" and not isinstance(
+                parent.token_dispatcher, AllToAllTokenDispatcher.Config
+            ):
+                # The fused kernels' padded-row contract is validated only
+                # against TorchAOTokenDispatcher's permute_and_pad.
+                raise ValueError(
+                    f"MXFP8 fusion_plan={self.config.fusion_plan!r} requires the "
+                    f"all-to-all token dispatcher; {fqn} uses "
+                    f"{type(parent.token_dispatcher).__qualname__}. Use "
+                    "fusion_plan='none' with this dispatcher."
+                )
             swap_token_dispatcher(parent, self.config.pad_multiple)
             base_module_cls = type(config)._owner
             quantized_cls = _get_mxfp8_grouped_experts_cls(base_module_cls)
@@ -243,6 +425,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
+                fusion_plan=self.config.fusion_plan,
             )
             if parent is None:
                 model_config = new_config
@@ -253,6 +436,6 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
 
         logger.info(
             f"Converted GroupedExperts to use dynamic {self.config.recipe_name} "
-            "quantization for grouped_mm ops"
+            f"quantization for grouped_mm ops (fusion_plan={self.config.fusion_plan})"
         )
         return model_config

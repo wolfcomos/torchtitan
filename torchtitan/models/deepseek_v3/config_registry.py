@@ -15,6 +15,7 @@ from torchtitan.components.quantization import (
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
 )
+from torchtitan.components.quantization.mxfp8.converter import FusionPlan
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import DATASETS
@@ -106,7 +107,12 @@ def deepseek_v3_debugmodel_mtp(seq_len: int | None = None) -> Trainer.Config:
     return config
 
 
-def deepseek_v3_debugmodel_mxfp8(seq_len: int | None = None) -> Trainer.Config:
+def deepseek_v3_debugmodel_mxfp8(
+    seq_len: int | None = None,
+    *,
+    fusion_plan: FusionPlan = "none",
+    pad_multiple: int = 128,
+) -> Trainer.Config:
     config = deepseek_v3_debugmodel(seq_len=seq_len)
     # Quantize the MoE expert grouped GEMMs to MXFP8, plus the dense Linear
     # layers in attention, the shared experts, and the dense-layer feed-forward.
@@ -126,10 +132,29 @@ def deepseek_v3_debugmodel_mxfp8(seq_len: int | None = None) -> Trainer.Config:
             ),
             MXFP8GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
-                pad_multiple=128,
+                pad_multiple=pad_multiple,
+                fusion_plan=fusion_plan,
             ),
         ],
     )
+    return config
+
+
+def deepseek_v3_debugmodel_mxfp8_swiglu_fusion(
+    seq_len: int | None = None,
+) -> Trainer.Config:
+    return deepseek_v3_debugmodel_mxfp8(seq_len=seq_len, fusion_plan="swiglu")
+
+
+def deepseek_v3_debugmodel_mxfp8_grouped_gemm_swiglu_fusion(
+    seq_len: int | None = None,
+) -> Trainer.Config:
+    config = deepseek_v3_debugmodel_mxfp8(
+        seq_len=seq_len, fusion_plan="grouped_gemm_swiglu", pad_multiple=256
+    )
+    # The cuDNN grouped-MLP ops (pytorch/ao#4820) record and wait on CUDA
+    # events per call, which CUDA-graph capture rejects.
+    config.training.disable_cuda_graphs = True
     return config
 
 
