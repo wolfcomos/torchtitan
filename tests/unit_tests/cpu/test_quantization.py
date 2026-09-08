@@ -686,12 +686,10 @@ def test_mxfp8_linear_loads_stock_checkpoint():
 
 
 def _bypass_mxfp8_experts_converter_gates(monkeypatch):
-    # ``convert()`` is a config-tree transform: neither the SM100 check nor the
-    # fused-kernel import check (the GPU tests' business) applies to it.
+    # ``convert()`` is a config-tree transform: the SM100 check does not apply.
     import torchtitan.components.quantization.mxfp8.converter as converter_mod
 
     monkeypatch.setattr(converter_mod, "has_cuda_capability", lambda *_: True)
-    monkeypatch.setattr(converter_mod, "_import_fusion_plan_kernels", lambda plan: None)
 
 
 @pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
@@ -834,51 +832,6 @@ def test_mxfp8_grouped_experts_converter_fused_plans_need_the_all_to_all_dispatc
         pad_multiple=128,
         dispatcher_cls=HybridEPTokenDispatcher.Config,
     )
-
-
-@pytest.mark.parametrize(
-    "fusion_plan, missing_module, match",
-    [
-        pytest.param(
-            "swiglu",
-            "torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8",
-            "pytorch/ao#4743",
-            id="swiglu-kernels",
-        ),
-        pytest.param(
-            "grouped_gemm_swiglu",
-            "torchao.prototype.moe_training.kernels.mxfp8.cudnn_grouped_mlp",
-            "pytorch/ao#4820",
-            id="cudnn-kernels",
-        ),
-        pytest.param("swiglu", "cutlass", "No module named 'cutlass'", id="runtime"),
-    ],
-)
-def test_mxfp8_grouped_experts_converter_names_what_a_fused_plan_cannot_import(
-    monkeypatch, fusion_plan, missing_module, match
-):
-    """Constructing a fused-plan converter on an installation without the
-    kernels raises at once, naming the torchao PR when torchao predates them
-    and the missing runtime package otherwise."""
-    import torchtitan.components.quantization.mxfp8.converter as converter_mod
-
-    monkeypatch.setattr(converter_mod, "has_cuda_capability", lambda *_: True)
-
-    def import_module(name):
-        raise ModuleNotFoundError(
-            f"No module named {missing_module!r}", name=missing_module
-        )
-
-    monkeypatch.setattr(converter_mod, "import_module", import_module)
-
-    with pytest.raises(ImportError, match=match) as excinfo:
-        MXFP8GroupedExpertsConverter(
-            MXFP8GroupedExpertsConverter.Config(
-                fusion_plan=fusion_plan,
-                pad_multiple=_FUSION_PLAN_PAD_MULTIPLES[fusion_plan],
-            )
-        )
-    assert excinfo.value.__cause__.name == missing_module
 
 
 def test_grouped_gemm_swiglu_contract_matches_the_torchao_ops():

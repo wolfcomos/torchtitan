@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field, fields
-from importlib import import_module
 from importlib.util import find_spec
 from typing import Literal
 
@@ -43,31 +42,6 @@ _FUSION_PLANS = ("none", "swiglu", "grouped_gemm_swiglu")
 # dispatcher, and the expert dimensions are multiples of the kernels' tile.
 _FUSION_PLAN_PAD_MULTIPLES = {"swiglu": 128, "grouped_gemm_swiglu": 256}
 _FUSED_DIM_ALIGNMENT = 128
-# torchao kernel module of each fused plan (under moe_training.kernels.mxfp8)
-# and the PR that added it; neither is in a torchao release yet.
-_FUSION_PLAN_KERNELS = {
-    "swiglu": ("cutedsl_gated_act_mxfp8", "pytorch/ao#4743"),
-    "grouped_gemm_swiglu": ("cudnn_grouped_mlp", "pytorch/ao#4820"),
-}
-
-
-def _import_fusion_plan_kernels(fusion_plan: str) -> None:
-    """Import what a fused plan runs on, so a torchao that predates the plan's
-    kernels or a missing runtime package fails at converter construction
-    rather than at the first expert forward.
-    """
-    kernels, pull_request = _FUSION_PLAN_KERNELS[fusion_plan]
-    try:
-        import_module(f"torchao.prototype.moe_training.kernels.mxfp8.{kernels}")
-        if fusion_plan == "grouped_gemm_swiglu":
-            # torchao's cuDNN ops import their runtime lazily at first launch.
-            import_module("cudnn")
-        from . import grouped_experts  # noqa: F401
-    except ImportError as import_error:
-        raise ImportError(
-            f"MXFP8 fusion_plan={fusion_plan!r} needs torchao's {kernels} kernels "
-            f"({pull_request}) and their runtime: {import_error}"
-        ) from import_error
 
 
 class MXFP8LinearConverter(QuantizationConverter):
@@ -364,8 +338,6 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         if not has_cuda_capability(10, 0):
             raise ValueError("MXFP8 is only supported on SM100 or later architectures")
 
-        if self.config.fusion_plan != "none":
-            _import_fusion_plan_kernels(self.config.fusion_plan)
         if (
             self.config.fusion_plan == "grouped_gemm_swiglu"
             and torch.cuda.is_available()
