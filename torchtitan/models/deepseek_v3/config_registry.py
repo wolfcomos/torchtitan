@@ -133,6 +133,53 @@ def deepseek_v3_debugmodel_mxfp8(seq_len: int | None = None) -> Trainer.Config:
     return config
 
 
+def _deepseek_v3_debugmodel_mxfp8_fusion(
+    seq_len: int | None, *, fusion_plan: str, pad_multiple: int
+) -> Trainer.Config:
+    # deepseek_v3_debugmodel_mxfp8 with a fused expert MLP. Converters are
+    # applied when the model spec is built, so the plan cannot be set on the
+    # stock flavor's config afterwards; the converter list is repeated here.
+    config = deepseek_v3_debugmodel(seq_len=seq_len)
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "debugmodel",
+        seq_len=seq_len,
+        converters=[
+            deepseek_v3_mxfp8_linear_converter_config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+            MXFP8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                pad_multiple=pad_multiple,
+                fusion_plan=fusion_plan,
+            ),
+        ],
+    )
+    return config
+
+
+def deepseek_v3_debugmodel_mxfp8_swiglu_fusion(
+    seq_len: int | None = None,
+) -> Trainer.Config:
+    return _deepseek_v3_debugmodel_mxfp8_fusion(
+        seq_len, fusion_plan="swiglu", pad_multiple=128
+    )
+
+
+def deepseek_v3_debugmodel_mxfp8_grouped_gemm_swiglu_fusion(
+    seq_len: int | None = None,
+) -> Trainer.Config:
+    config = _deepseek_v3_debugmodel_mxfp8_fusion(
+        seq_len, fusion_plan="grouped_gemm_swiglu", pad_multiple=256
+    )
+    # The cuDNN grouped-MLP ops (pytorch/ao#4820) record and wait on CUDA
+    # events per call, which CUDA-graph capture rejects.
+    config.training.disable_cuda_graphs = True
+    return config
+
+
 def deepseek_v3_debugmodel_hybridep(seq_len: int | None = None) -> Trainer.Config:
     config = deepseek_v3_debugmodel(seq_len=seq_len)
     config.model_spec = model_registry(

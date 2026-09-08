@@ -8,9 +8,12 @@ from dataclasses import dataclass, field, fields
 from importlib.util import find_spec
 from typing import Literal
 
+import torch
+
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
@@ -30,6 +33,15 @@ try:
 except ImportError as import_error:
     MXFP8Linear = None
     _mxfp8_linear_import_error = import_error
+
+
+FusionPlan = Literal["none", "swiglu", "grouped_gemm_swiglu"]
+_FUSION_PLANS = ("none", "swiglu", "grouped_gemm_swiglu")
+# Contract of the fused plans (implemented in grouped_experts.py): every
+# expert's token group is zero-padded to this many rows by the token
+# dispatcher, and the expert dimensions are multiples of the kernels' tile.
+_FUSION_PLAN_PAD_MULTIPLES = {"swiglu": 128, "grouped_gemm_swiglu": 256}
+_FUSED_DIM_ALIGNMENT = 128
 
 
 class MXFP8LinearConverter(QuantizationConverter):
@@ -169,6 +181,7 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             recipe_name: str = "mxfp8_rceil"
+            fusion_plan: FusionPlan = "none"
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -179,6 +192,46 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
 
             recipe = MXFP8TrainingRecipe(config.recipe_name)
             self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+            self.fusion_plan = config.fusion_plan
+
+        def _grouped_mlp(self, *, x_RD, w1_EFD, w2_EDF, w3_EFD, offsets_E):
+            if self.fusion_plan == "none":
+                return super()._grouped_mlp(
+                    x_RD=x_RD,
+                    w1_EFD=w1_EFD,
+                    w2_EDF=w2_EDF,
+                    w3_EFD=w3_EFD,
+                    offsets_E=offsets_E,
+                )
+            from . import grouped_experts
+
+            # Casts stay outside the composites so autograd covers high-precision
+            # master weights; the cuDNN plan's packed gate/up operand is a
+            # differentiable copy of the stock parameters. The output takes
+            # ``x_RD``'s dtype like the stock MLP.
+            x_bf16_RD = x_RD.bfloat16()
+            w1_EFD, w2_EDF, w3_EFD = (
+                w1_EFD.bfloat16(),
+                w2_EDF.bfloat16(),
+                w3_EFD.bfloat16(),
+            )
+            grouped_experts._validate_inputs(x_bf16_RD, w1_EFD, self.fusion_plan)
+            if self.fusion_plan == "swiglu":
+                out_RD = grouped_experts._MXFP8SwiGLUFusionFunction.apply(
+                    x_bf16_RD,
+                    w1_EFD,
+                    w3_EFD,
+                    w2_EDF.transpose(-2, -1),
+                    offsets_E,
+                )
+            else:
+                out_RD = grouped_experts._MXFP8GroupedGemmSwiGLUFusionFunction.apply(
+                    x_bf16_RD,
+                    grouped_experts._pack_w13_blocks(w1_EFD, w3_EFD),
+                    w2_EDF,
+                    offsets_E,
+                )
+            return out_RD.type_as(x_RD)
 
         def _grouped_mm(self, *, A, weight_EOI, offs):
             from torchao.prototype.moe_training.utils import (
@@ -215,6 +268,43 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         Pad per-expert token groups to this multiple for MXFP8 grouped GEMM alignment.
         The CuTeDSL quantization kernel on sm_100 requires multiples of 128.
         """
+        fusion_plan: FusionPlan = "none"
+        """
+        Which part of the expert SwiGLU MLP runs as one fused torchao kernel.
+
+        - none: three separately quantized grouped GEMMs with the SwiGLU in
+          BF16 between them.
+        - swiglu: the two grouped GEMMs stay separate; the SwiGLU and both MXFP8
+          quantizations of its output (rowwise for the down GEMM, columnwise for
+          the down weight gradient) run in one CuTeDSL kernel (torchao
+          ``cutedsl_gated_act_mxfp8``, pytorch/ao#4743). Requires ``pad_multiple``
+          a multiple of 128 and ``dim`` / ``hidden_dim`` multiples of 128.
+        - grouped_gemm_swiglu: grouped GEMM, SwiGLU and MXFP8 quantization fused
+          in one cuDNN kernel per direction (torchao ``cudnn_grouped_mlp`` ops,
+          pytorch/ao#4820). Requires ``pad_multiple`` a multiple of 256 (the
+          kernels' fixed group padding) and ``dim`` / ``hidden_dim`` multiples
+          of 128.
+
+        Both fused plans implement the stock ``GroupedExperts`` SwiGLU MLP and
+        quantize with RCEIL scales; ``GptOssGroupedExperts`` (biases, clamped
+        SwiGLU) does not reach the ``_grouped_mlp`` seam and keeps the per-GEMM
+        path.
+        """
+
+        def __post_init__(self) -> None:
+            if self.fusion_plan not in _FUSION_PLANS:
+                raise ValueError(
+                    f"MXFP8 fusion_plan must be one of {_FUSION_PLANS}; got "
+                    f"{self.fusion_plan!r}."
+                )
+            if self.fusion_plan != "none" and (
+                self.pad_multiple % _FUSION_PLAN_PAD_MULTIPLES[self.fusion_plan]
+            ):
+                raise ValueError(
+                    f"MXFP8 fusion_plan={self.fusion_plan!r} requires pad_multiple "
+                    f"to be a multiple of {_FUSION_PLAN_PAD_MULTIPLES[self.fusion_plan]}"
+                    f"; got {self.pad_multiple}."
+                )
 
     def __init__(self, config: Config):
         self.config = config
@@ -227,6 +317,17 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
         if not has_cuda_capability(10, 0):
             raise ValueError("MXFP8 is only supported on SM100 or later architectures")
 
+        if (
+            self.config.fusion_plan == "grouped_gemm_swiglu"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() != (10, 0)
+        ):
+            # The cuDNN grouped-MLP wrappers are built for SM 10.0 only.
+            raise ValueError(
+                "MXFP8 fusion_plan='grouped_gemm_swiglu' runs only on SM 10.0 "
+                f"GPUs; got {torch.cuda.get_device_capability()}."
+            )
+
         if not self.config.model_compile_enabled:
             logger.warning(
                 "torch.compile enablement is required for highest performance "
@@ -236,6 +337,17 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
     def convert(self, model_config):
         for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
             # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
+            if self.config.fusion_plan != "none" and not isinstance(
+                parent.token_dispatcher, AllToAllTokenDispatcher.Config
+            ):
+                # The fused kernels' padded-row contract is validated only
+                # against TorchAOTokenDispatcher's permute_and_pad.
+                raise ValueError(
+                    f"MXFP8 fusion_plan={self.config.fusion_plan!r} requires the "
+                    f"all-to-all token dispatcher; got "
+                    f"{type(parent.token_dispatcher).__qualname__}. Use "
+                    "fusion_plan='none' with this dispatcher."
+                )
             swap_token_dispatcher(parent, self.config.pad_multiple)
             base_module_cls = type(config)._owner
             quantized_cls = _get_mxfp8_grouped_experts_cls(base_module_cls)
@@ -243,6 +355,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
+                fusion_plan=self.config.fusion_plan,
             )
             if parent is None:
                 model_config = new_config

@@ -15,6 +15,7 @@ MXFP8 training can provide substantial training speedups for models where the ma
   - [Usage](#usage)
 - [MXFP8 for Grouped GEMMs (MoE)](#mxfp8-for-grouped-gemms-moe)
   - [Usage](#usage-1)
+  - [Fusion plans](#fusion-plans)
 - [Example Python Configuration](#example-python-configuration)
 - [Performance](#performance)
   - [Dense Models](#dense-models)
@@ -227,12 +228,56 @@ model_spec = model_registry(
 
 * `recipe_name="mxfp8_rceil"`: MXFP8 dynamic quantization with RCEIL rounding mode for scale calculation.
 * `model_compile_enabled`: set to `True` when `torch.compile` is enabled for the model.
+* `fusion_plan="none"`: how much of the expert SwiGLU MLP runs as one fused kernel; see [Fusion plans](#fusion-plans).
 
 **Important Notes:**
 
 * **Token group alignment**: For MoE training with MXFP8, token group sizes must be multiples of 32 (the MXFP8 block size). The token dispatcher is automatically swapped to a padded variant (`TorchAOTokenDispatcher` or `DeepEPTokenDispatcher`) by `swap_token_dispatcher()` when the converter runs. Expert parallelism (EP) must be enabled.
 
 * **torch.compile recommendation**: All benchmarks in this document were run with `torch.compile` enabled. We recommend using `torch.compile` for best performance.
+
+#### Fusion plans
+
+By default the converter quantizes the three expert grouped GEMMs separately and
+runs the SwiGLU between them in BF16. `MXFP8GroupedExpertsConverter.Config.fusion_plan`
+selects a fused alternative for the routed-expert MLP `silu(x @ w1.T) * (x @ w3.T) @ w2.T`:
+
+| `fusion_plan` | What runs fused | torchao kernels | `pad_multiple` | Expert dims |
+|---|---|---|---|---|
+| `"none"` (default) | nothing: three quantized grouped GEMMs, BF16 SwiGLU | `_quantize_then_scaled_grouped_mm` | any multiple of 32 (128 on SM100) | multiples of 32 |
+| `"swiglu"` | the SwiGLU and both MXFP8 quantizations of its output (rowwise for the down GEMM, columnwise for the down weight gradient) in one CuTeDSL kernel; the three grouped GEMMs stay separate | `cutedsl_gated_act_mxfp8` ([pytorch/ao#4743](https://github.com/pytorch/ao/pull/4743)) | multiple of 128 | multiples of 128 |
+| `"grouped_gemm_swiglu"` | grouped GEMM + SwiGLU + MXFP8 quantization in one cuDNN kernel per direction (forward, activation gradient, weight gradient) | `cudnn_grouped_mlp` ([pytorch/ao#4820](https://github.com/pytorch/ao/pull/4820)) | multiple of 256 | multiples of 128 |
+
+```python
+MXFP8GroupedExpertsConverter.Config(
+    model_compile_enabled=True,
+    pad_multiple=256,
+    fusion_plan="grouped_gemm_swiglu",
+)
+```
+
+Example flavors: `deepseek_v3_debugmodel_mxfp8_swiglu_fusion` and
+`deepseek_v3_debugmodel_mxfp8_grouped_gemm_swiglu_fusion`.
+
+Both fused plans keep the stock `w1_EFD` / `w2_EDF` / `w3_EFD` parameters, so
+checkpoints and initialization are identical to the unfused converter:
+`"swiglu"` runs the stock three grouped GEMMs (gate, up, down) and fuses only
+the activation boundary; `"grouped_gemm_swiglu"` packs the gate and up weights
+into the kernel layout at forward time. They require
+`recipe_name="mxfp8_rceil"` (the kernels quantize with RCEIL scales) and are
+numerically close to, but not bitwise equal to, `fusion_plan="none"` (see
+[MoE models](#moe-models)).
+
+Requirements (there is no silent fallback to the unfused path):
+
+* A torchao build with the plan's kernels; `"grouped_gemm_swiglu"` also needs the
+  `cudnn-frontend` python package >= 1.27.
+* The stock `GroupedExperts` (GPT-OSS experts are not supported) with `dim` and
+  `hidden_dim` multiples of 128, also per rank under tensor parallelism, and the
+  all-to-all token dispatcher (swapped to `TorchAOTokenDispatcher`, whose padding
+  is what the kernels' row contract has been validated against).
+* `"grouped_gemm_swiglu"` runs on SM 10.0 only and needs
+  `training.disable_cuda_graphs=True` (the cuDNN ops record CUDA events per call).
 
 ### Example Python Configuration
 
@@ -305,6 +350,30 @@ Training and model configurations for this run:
 - `mxfp8` applied to routed experts computation (grouped GEMMs)
 - `mxfp8` applied to all linear layers except: `output`, `router.gate`, `attention.wk`, `attention.wv` (Wk and Wv too small to benefit from mxfp8)
 
+##### Fusion plans (routed experts)
+
+DeepSeek-V3 16B (`deepseek_v3_16b` with both MXFP8 converters), 4x GB200,
+FSDP=4, EP=4, TP=1, `--debug.seed 42`, `--debug.moe_force_load_balance`, all arms
+from one checkpoint, median tokens/s over steps 11-50, eager (unlike the tables
+above these runs are not compiled, so only the relative numbers are meaningful).
+The `"none"`, pad 256 arm isolates the cost of the 256-row padding the cuDNN
+kernels require from the fusion gain:
+
+| Local batch | `"none"`, pad 128 (default) | `"none"`, pad 256 | `"grouped_gemm_swiglu"`, pad 256 | vs default | vs pad 256 |
+|---|---|---|---|---|---|
+| 4 | 14289 | 13258 | 13563 | -5.1% | +2.3% |
+| 8 | 18706 | 17882 | 18783 | +0.4% | +5.0% |
+
+Loss parity: the two `"none"` arms are identical to 5 decimals at every step;
+`"grouped_gemm_swiglu"` vs `"none"` at pad 256 differs by at most 3.2e-3 over
+steps 11-50. Peak memory 94.1 GiB vs 87.1 GiB at local batch 4.
+
+`"swiglu"` was measured separately (compiled, on the kernel's original
+integration branch, so its baseline is not comparable to the table above):
++2.5% tokens/s over `"none"` at pad 128, local batch 4 (n=4). Its mean loss over
+3 seeds x 500 steps stays within the unfused arm's seed-to-seed standard
+deviation (8.4e-3). Kernel-level comparisons: pytorch/ao#4743, pytorch/ao#4820.
+
 #### Dense model convergence
 
 A deterministic 3,000-step comparison on C4 shows that Llama 3 8B with
@@ -344,6 +413,7 @@ All distributed communication for MXFP8 training is currently done in high preci
 ### Known Limitations
 - Currently in prototype stage - no BC guarantees.
 - Requires torch nightly - important bug fixes have landed since 2.9.1
+- Fusion plans require unreleased torchao kernels (pytorch/ao#4743, pytorch/ao#4820).
 
 ### Additional Resources
 
