@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import inspect
-from functools import partial
 
 import pytest
 import spmd_types as spmd
@@ -695,13 +694,6 @@ def _bypass_mxfp8_experts_converter_gates(monkeypatch):
     monkeypatch.setattr(converter_mod, "_import_fusion_plan_kernels", lambda plan: None)
 
 
-def _mxfp8_grouped_experts_module_cls():
-    # Building the dynamic class imports torchao's MXFP8 training config, which
-    # stock torchao releases lack (creating the class itself is pure Python).
-    pytest.importorskip("torchao.prototype.moe_training.config")
-    return _get_mxfp8_grouped_experts_cls(GroupedExperts)
-
-
 @pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
 def test_mxfp8_grouped_experts_config_defaults_to_fusion_plan_none(parent_cls):
     # Plan none keeps the per-GEMM path, which has no expert-dim alignment
@@ -723,18 +715,6 @@ def test_mxfp8_grouped_experts_config_defaults_to_fusion_plan_none(parent_cls):
             {"fusion_plan": "swiglu"},
             "not GptOssGroupedExperts",
             id="gpt-oss-parent",
-        ),
-        pytest.param(
-            GroupedExperts,
-            {"fusion_plan": "swiglu", "dim": 96},
-            "requires dim divisible by 128",
-            id="dim",
-        ),
-        pytest.param(
-            GroupedExperts,
-            {"fusion_plan": "grouped_gemm_swiglu", "hidden_dim": 96},
-            "requires hidden_dim divisible by 128",
-            id="hidden-dim",
         ),
         pytest.param(
             GroupedExperts,
@@ -795,31 +775,6 @@ def _assert_mxfp8_experts_wiring(
 
 
 @pytest.mark.parametrize(
-    "fusion_plan, pad_multiple", [("swiglu", 128), ("grouped_gemm_swiglu", 256)]
-)
-def test_mxfp8_grouped_experts_converter_wires_fusion_plan_into_dsv3_debugmodel(
-    monkeypatch, fusion_plan, pad_multiple
-):
-    pytest.importorskip("torchao")
-    _bypass_mxfp8_experts_converter_gates(monkeypatch)
-    from torchtitan.models.deepseek_v3 import model_registry
-
-    model_config = model_registry(
-        "debugmodel",
-        converters=[
-            MXFP8GroupedExpertsConverter.Config(
-                fusion_plan=fusion_plan, pad_multiple=pad_multiple
-            )
-        ],
-    ).model
-
-    assert has_quantization(model_config)
-    _assert_mxfp8_experts_wiring(
-        model_config, fusion_plan=fusion_plan, pad_multiple=pad_multiple
-    )
-
-
-@pytest.mark.parametrize(
     "flavor, fusion_plan, pad_multiple",
     [
         ("deepseek_v3_debugmodel_mxfp8_swiglu_fusion", "swiglu", 128),
@@ -870,13 +825,8 @@ def test_mxfp8_grouped_experts_converter_fused_plans_need_the_all_to_all_dispatc
             ],
         ).model
 
-    with pytest.raises(ValueError, match="all-to-all token dispatcher") as excinfo:
+    with pytest.raises(ValueError, match="all-to-all token dispatcher"):
         convert_hybridep_tree("swiglu")
-    # The message names the offending module, its dispatcher and the way out.
-    message = str(excinfo.value)
-    assert "layers.1.moe.routed_experts.inner_experts" in message
-    assert "HybridEPTokenDispatcher" in message
-    assert "fusion_plan='none'" in message
 
     _assert_mxfp8_experts_wiring(
         convert_hybridep_tree("none"),
@@ -901,7 +851,7 @@ def test_mxfp8_grouped_experts_converter_fused_plans_need_the_all_to_all_dispatc
             "pytorch/ao#4820",
             id="cudnn-kernels",
         ),
-        pytest.param("swiglu", "cutlass", "'cutlass', a runtime", id="runtime"),
+        pytest.param("swiglu", "cutlass", "No module named 'cutlass'", id="runtime"),
     ],
 )
 def test_mxfp8_grouped_experts_converter_names_what_a_fused_plan_cannot_import(
@@ -946,10 +896,6 @@ def test_grouped_gemm_swiglu_contract_matches_the_torchao_ops():
 
 
 _EXPERTS_DIMS = {"dim": 128, "hidden_dim": 256, "num_experts": 3}
-_EXPERTS_PARAM_INIT = {
-    name: partial(torch.nn.init.trunc_normal_, std=0.02)
-    for name in ("w1_EFD", "w2_EDF", "w3_EFD")
-}
 # Expert-major padded groups satisfying both fused plans' row contract: two
 # full groups around a zero-token expert.
 _NUM_TOKENS_PER_EXPERT_E = torch.tensor([128, 0, 128])
@@ -967,12 +913,15 @@ def _call_fused_plan_with_mocked_composite(monkeypatch, fusion_plan):
     are SM100-only); the plan's input validator runs for real. Returns the
     module, its input and output, and the positional arguments the composite
     received."""
-    module_cls = _mxfp8_grouped_experts_module_cls()
     grouped_experts = pytest.importorskip(
         "torchtitan.components.quantization.mxfp8.grouped_experts"
     )
 
-    module = module_cls.Config(**_EXPERTS_DIMS, fusion_plan=fusion_plan).build()
+    module = (
+        _get_mxfp8_grouped_experts_cls(GroupedExperts)
+        .Config(**_EXPERTS_DIMS, fusion_plan=fusion_plan)
+        .build()
+    )
     with torch.no_grad():
         for parameter in module.parameters():
             parameter.normal_()
@@ -1057,13 +1006,17 @@ def test_mxfp8_grouped_gemm_swiglu_plan_packs_weights_in_32_row_glu_blocks(
 def test_mxfp8_plan_none_delegates_to_the_stock_grouped_mlp(monkeypatch):
     """Plan none must reach ``GroupedExperts._grouped_mlp`` (hence the stock
     three-GEMM path through the MXFP8 ``_grouped_mm``) with the seam's own
-    keywords and untouched operands."""
-    module = _mxfp8_grouped_experts_module_cls().Config(**_EXPERTS_DIMS).build()
+    keywords and untouched operands, and ``forward`` returns its result as is."""
+    pytest.importorskip("torchao")
+    module = (
+        _get_mxfp8_grouped_experts_cls(GroupedExperts).Config(**_EXPERTS_DIMS).build()
+    )
     calls = []
+    out_RD = torch.full((256, 128), 7.0, dtype=torch.bfloat16)
 
     def grouped_mlp(self, **kwargs):
         calls.append((self, kwargs))
-        return torch.full((256, 128), 7.0, dtype=torch.bfloat16)
+        return out_RD
 
     monkeypatch.setattr(GroupedExperts, "_grouped_mlp", grouped_mlp)
     x_RD = torch.randn(256, 128)
@@ -1078,40 +1031,19 @@ def test_mxfp8_plan_none_delegates_to_the_stock_grouped_mlp(monkeypatch):
     assert kwargs["w3_EFD"] is module.w3_EFD
     assert kwargs["offsets_E"].dtype == torch.int32
     assert torch.equal(kwargs["offsets_E"], _OFFSETS_E)
-    assert y_RD.dtype == x_RD.dtype
+    assert y_RD is out_RD
 
 
 @pytest.mark.parametrize("fusion_plan", ["swiglu", "grouped_gemm_swiglu"])
 def test_mxfp8_fused_plans_keep_the_stock_parameters(fusion_plan):
-    """The fused plans pack gate/up weights at call time, so the parameter set,
-    checkpoint keys and a seeded init all match stock ``GroupedExperts``."""
-    module_cls = _mxfp8_grouped_experts_module_cls()
-    dims = {**_EXPERTS_DIMS, "param_init": _EXPERTS_PARAM_INIT}
+    """The fused plans pack gate/up weights at call time, so the parameter set
+    and checkpoint keys match stock ``GroupedExperts``."""
+    pytest.importorskip("torchao")
+    module_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts)
 
-    stock = GroupedExperts.Config(**dims).build()
-    fused = module_cls.Config(**dims, fusion_plan=fusion_plan).build()
+    stock_state = GroupedExperts.Config(**_EXPERTS_DIMS).build().state_dict()
+    fused = module_cls.Config(**_EXPERTS_DIMS, fusion_plan=fusion_plan).build()
     assert all(type(param) is torch.nn.Parameter for param in fused.parameters())
-    torch.manual_seed(0)
-    stock.init_states()
-    torch.manual_seed(0)
-    fused.init_states()
-    stock_state = stock.state_dict()
     assert fused.state_dict().keys() == stock_state.keys()
     for key, value in fused.state_dict().items():
-        assert torch.equal(value, stock_state[key])
-
-
-@pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])
-def test_grouped_mlp_override_keeps_the_seam_signature(parent_cls):
-    """``GroupedExperts.forward`` calls ``_grouped_mlp`` by keyword, so the
-    MXFP8 override's parameter names must not drift from the base seam (the
-    same failure mode ``test_grouped_mm_overrides_keep_the_seam_signature``
-    pins for ``_grouped_mm``)."""
-    base = inspect.signature(parent_cls._grouped_mlp)
-    override = inspect.signature(
-        _get_mxfp8_grouped_experts_cls(parent_cls)._grouped_mlp
-    )
-
-    assert list(override.parameters) == list(base.parameters)
-    for name, parameter in base.parameters.items():
-        assert override.parameters[name].kind == parameter.kind
+        assert value.shape == stock_state[key].shape

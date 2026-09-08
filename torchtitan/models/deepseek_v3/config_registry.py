@@ -15,7 +15,6 @@ from torchtitan.components.quantization import (
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
 )
-from torchtitan.components.quantization.mxfp8.converter import FusionPlan
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import DATASETS
@@ -107,12 +106,7 @@ def deepseek_v3_debugmodel_mtp(seq_len: int | None = None) -> Trainer.Config:
     return config
 
 
-def deepseek_v3_debugmodel_mxfp8(
-    seq_len: int | None = None,
-    *,
-    fusion_plan: FusionPlan = "none",
-    pad_multiple: int = 128,
-) -> Trainer.Config:
+def deepseek_v3_debugmodel_mxfp8(seq_len: int | None = None) -> Trainer.Config:
     config = deepseek_v3_debugmodel(seq_len=seq_len)
     # Quantize the MoE expert grouped GEMMs to MXFP8, plus the dense Linear
     # layers in attention, the shared experts, and the dense-layer feed-forward.
@@ -120,6 +114,32 @@ def deepseek_v3_debugmodel_mxfp8(
     # (moe.router.gate) and lm_head are left in bf16.
     # pad_multiple=128 is required by the CuTeDSL quantization kernel
     # on sm_100 (e.g. B200)
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "debugmodel",
+        seq_len=seq_len,
+        converters=[
+            deepseek_v3_mxfp8_linear_converter_config(
+                model_compile_enabled=model_compile_enabled,
+            ),
+            MXFP8GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
+def _deepseek_v3_debugmodel_mxfp8_fusion(
+    seq_len: int | None, *, fusion_plan: str, pad_multiple: int
+) -> Trainer.Config:
+    # deepseek_v3_debugmodel_mxfp8 with a fused expert MLP. Converters are
+    # applied when the model spec is built, so the plan cannot be set on the
+    # stock flavor's config afterwards; the converter list is repeated here.
+    config = deepseek_v3_debugmodel(seq_len=seq_len)
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
@@ -143,14 +163,16 @@ def deepseek_v3_debugmodel_mxfp8(
 def deepseek_v3_debugmodel_mxfp8_swiglu_fusion(
     seq_len: int | None = None,
 ) -> Trainer.Config:
-    return deepseek_v3_debugmodel_mxfp8(seq_len=seq_len, fusion_plan="swiglu")
+    return _deepseek_v3_debugmodel_mxfp8_fusion(
+        seq_len, fusion_plan="swiglu", pad_multiple=128
+    )
 
 
 def deepseek_v3_debugmodel_mxfp8_grouped_gemm_swiglu_fusion(
     seq_len: int | None = None,
 ) -> Trainer.Config:
-    config = deepseek_v3_debugmodel_mxfp8(
-        seq_len=seq_len, fusion_plan="grouped_gemm_swiglu", pad_multiple=256
+    config = _deepseek_v3_debugmodel_mxfp8_fusion(
+        seq_len, fusion_plan="grouped_gemm_swiglu", pad_multiple=256
     )
     # The cuDNN grouped-MLP ops (pytorch/ao#4820) record and wait on CUDA
     # events per call, which CUDA-graph capture rejects.

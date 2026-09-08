@@ -43,8 +43,8 @@ _FUSION_PLANS = ("none", "swiglu", "grouped_gemm_swiglu")
 # dispatcher, and the expert dimensions are multiples of the kernels' tile.
 _FUSION_PLAN_PAD_MULTIPLES = {"swiglu": 128, "grouped_gemm_swiglu": 256}
 _FUSED_DIM_ALIGNMENT = 128
-# The torchao kernel module (under moe_training.kernels.mxfp8) each fused plan
-# runs on and the PR that added it.
+# torchao kernel module of each fused plan (under moe_training.kernels.mxfp8)
+# and the PR that added it; neither is in a torchao release yet.
 _FUSION_PLAN_KERNELS = {
     "swiglu": ("cutedsl_gated_act_mxfp8", "pytorch/ao#4743"),
     "grouped_gemm_swiglu": ("cudnn_grouped_mlp", "pytorch/ao#4820"),
@@ -63,21 +63,10 @@ def _import_fusion_plan_kernels(fusion_plan: str) -> None:
             # torchao's cuDNN ops import their runtime lazily at first launch.
             import_module("cudnn")
         from . import grouped_experts  # noqa: F401
-
     except ImportError as import_error:
-        missing = import_error.name or ""
-        if missing.startswith("torchao"):
-            reason = (
-                f"needs torchao's {kernels} kernels, added in {pull_request} and "
-                "not in any torchao release; install a torchao that contains them"
-            )
-        else:
-            reason = (
-                f"could not import {missing!r}, a runtime the {kernels} kernels need"
-            )
         raise ImportError(
-            f"MXFP8 fusion_plan={fusion_plan!r} {reason} (the chained error "
-            "names what failed to import)."
+            f"MXFP8 fusion_plan={fusion_plan!r} needs torchao's {kernels} kernels "
+            f"({pull_request}) and their runtime: {import_error}"
         ) from import_error
 
 
@@ -207,9 +196,7 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
     proper ``_owner`` set by ``__init_subclass__``.
 
     The subclass overrides ``_grouped_mm`` to call torchao's
-    ``_quantize_then_scaled_grouped_mm``. With a ``fusion_plan`` other than
-    ``"none"`` it also overrides the ``_grouped_mlp`` seam so the whole expert
-    MLP runs as one fused composite (``GroupedExperts`` parents only).
+    ``_quantize_then_scaled_grouped_mm``.
     """
     if parent_cls in _mxfp8_experts_cache:
         return _mxfp8_experts_cache[parent_cls]
@@ -245,17 +232,6 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
                         f"GroupedExperts, not {parent_cls.__name__}; use "
                         "fusion_plan='none' for this model."
                     )
-                # dim / hidden_dim are known at config-build time (the TP degree
-                # is not); the composite re-checks the per-rank local dims.
-                for name in ("dim", "hidden_dim"):
-                    value = getattr(self, name)
-                    if value % _FUSED_DIM_ALIGNMENT:
-                        raise ValueError(
-                            f"MXFP8 fusion_plan={self.fusion_plan!r} requires "
-                            f"{name} divisible by {_FUSED_DIM_ALIGNMENT}; got "
-                            f"{name}={value}. Use fusion_plan='none' for this "
-                            "model."
-                        )
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -281,27 +257,30 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
 
             # Casts stay outside the composites so autograd covers high-precision
             # master weights; the packed gate/up operand is a differentiable copy
-            # of the stock parameters.
-            x_RD = x_RD.bfloat16()
+            # of the stock parameters. The output takes ``x_RD``'s dtype like the
+            # stock MLP.
+            x_bf16_RD = x_RD.bfloat16()
             w1_EFD, w2_EDF, w3_EFD = (
                 w1_EFD.bfloat16(),
                 w2_EDF.bfloat16(),
                 w3_EFD.bfloat16(),
             )
+            grouped_experts._validate_inputs(x_bf16_RD, w1_EFD, self.fusion_plan)
             if self.fusion_plan == "swiglu":
-                w13_E2FD = torch.cat([w1_EFD, w3_EFD], dim=1)
-                w2_t_EFD = w2_EDF.transpose(-2, -1)
-                grouped_experts._validate_swiglu_inputs(x_RD, w1_EFD, w2_t_EFD)
-                return grouped_experts._MXFP8SwiGLUFusionFunction.apply(
-                    x_RD, w13_E2FD, w2_t_EFD, offsets_E
+                out_RD = grouped_experts._MXFP8SwiGLUFusionFunction.apply(
+                    x_bf16_RD,
+                    torch.cat([w1_EFD, w3_EFD], dim=1),
+                    w2_EDF.transpose(-2, -1),
+                    offsets_E,
                 )
-            grouped_experts._validate_grouped_gemm_inputs(x_RD, w1_EFD)
-            return grouped_experts._MXFP8GroupedGemmSwiGLUFusionFunction.apply(
-                x_RD,
-                grouped_experts._pack_w13_blocks(w1_EFD, w3_EFD),
-                w2_EDF,
-                offsets_E,
-            )
+            else:
+                out_RD = grouped_experts._MXFP8GroupedGemmSwiGLUFusionFunction.apply(
+                    x_bf16_RD,
+                    grouped_experts._pack_w13_blocks(w1_EFD, w3_EFD),
+                    w2_EDF,
+                    offsets_E,
+                )
+            return out_RD.type_as(x_RD)
 
         def _grouped_mm(self, *, A, weight_EOI, offs):
             from torchao.prototype.moe_training.utils import (
@@ -405,7 +384,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
             )
 
     def convert(self, model_config):
-        for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+        for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
             # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
             if self.config.fusion_plan != "none" and not isinstance(
                 parent.token_dispatcher, AllToAllTokenDispatcher.Config
@@ -414,7 +393,7 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
                 # against TorchAOTokenDispatcher's permute_and_pad.
                 raise ValueError(
                     f"MXFP8 fusion_plan={self.config.fusion_plan!r} requires the "
-                    f"all-to-all token dispatcher; {fqn} uses "
+                    f"all-to-all token dispatcher; got "
                     f"{type(parent.token_dispatcher).__qualname__}. Use "
                     "fusion_plan='none' with this dispatcher."
                 )
@@ -436,6 +415,6 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
 
         logger.info(
             f"Converted GroupedExperts to use dynamic {self.config.recipe_name} "
-            f"quantization for grouped_mm ops (fusion_plan={self.config.fusion_plan})"
+            "quantization for grouped_mm ops"
         )
         return model_config

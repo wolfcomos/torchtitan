@@ -242,11 +242,11 @@ By default the converter quantizes the three expert grouped GEMMs separately and
 runs the SwiGLU between them in BF16. `MXFP8GroupedExpertsConverter.Config.fusion_plan`
 selects a fused alternative for the routed-expert MLP `silu(x @ w1.T) * (x @ w3.T) @ w2.T`:
 
-| `fusion_plan` | What runs fused | torchao kernels | `pad_multiple` | Expert dims | CUDA graphs |
-|---|---|---|---|---|---|
-| `"none"` (default) | nothing: three quantized grouped GEMMs, BF16 SwiGLU | `_quantize_then_scaled_grouped_mm` | any multiple of 32 (128 on SM100) | multiples of 32 | yes |
-| `"swiglu"` | the SwiGLU and both MXFP8 quantizations of its output (rowwise for the down GEMM, columnwise for the down weight gradient) in one CuTeDSL kernel; the two grouped GEMMs stay separate | `cutedsl_gated_act_mxfp8` ([pytorch/ao#4743](https://github.com/pytorch/ao/pull/4743)) | multiple of 128 | multiples of 128 | yes |
-| `"grouped_gemm_swiglu"` | grouped GEMM + SwiGLU + MXFP8 quantization in one cuDNN kernel per direction (forward, activation gradient, weight gradient) | `cudnn_grouped_mlp` ([pytorch/ao#4820](https://github.com/pytorch/ao/pull/4820)) | multiple of 256 | multiples of 128 | no (the ops record CUDA events per call) |
+| `fusion_plan` | What runs fused | torchao kernels | `pad_multiple` | Expert dims |
+|---|---|---|---|---|
+| `"none"` (default) | nothing: three quantized grouped GEMMs, BF16 SwiGLU | `_quantize_then_scaled_grouped_mm` | any multiple of 32 (128 on SM100) | multiples of 32 |
+| `"swiglu"` | the SwiGLU and both MXFP8 quantizations of its output (rowwise for the down GEMM, columnwise for the down weight gradient) in one CuTeDSL kernel; the two grouped GEMMs stay separate | `cutedsl_gated_act_mxfp8` ([pytorch/ao#4743](https://github.com/pytorch/ao/pull/4743)) | multiple of 128 | multiples of 128 |
+| `"grouped_gemm_swiglu"` | grouped GEMM + SwiGLU + MXFP8 quantization in one cuDNN kernel per direction (forward, activation gradient, weight gradient) | `cudnn_grouped_mlp` ([pytorch/ao#4820](https://github.com/pytorch/ao/pull/4820)) | multiple of 256 | multiples of 128 |
 
 ```python
 MXFP8GroupedExpertsConverter.Config(
@@ -266,7 +266,7 @@ and initialization are identical to the unfused converter. They require
 numerically close to, but not bitwise equal to, `fusion_plan="none"` (see
 [MoE models](#moe-models)).
 
-Requirements (the converter raises otherwise; there is no silent fallback):
+Requirements (there is no silent fallback to the unfused path):
 
 * A torchao build with the plan's kernels; `"grouped_gemm_swiglu"` also needs the
   `cudnn-frontend` python package >= 1.27.
@@ -275,7 +275,7 @@ Requirements (the converter raises otherwise; there is no silent fallback):
   all-to-all token dispatcher (swapped to `TorchAOTokenDispatcher`, whose padding
   is what the kernels' row contract has been validated against).
 * `"grouped_gemm_swiglu"` runs on SM 10.0 only and needs
-  `training.disable_cuda_graphs=True`.
+  `training.disable_cuda_graphs=True` (the cuDNN ops record CUDA events per call).
 
 ### Example Python Configuration
 
@@ -350,17 +350,12 @@ Training and model configurations for this run:
 
 ##### Fusion plans (routed experts)
 
-DeepSeek-V3 16B (`deepseek_v3_16b` with both MXFP8 converters), 4x GB200, 50
-steps, median tokens/s over steps 11-50, eager. Unlike the tables above these
-runs are not compiled, so only the relative numbers are meaningful.
-
-- Parallelism: FSDP=4, EP=4, TP=1
-- `--debug.seed 42`, `--debug.moe_force_load_balance`, all arms from one checkpoint
-- Dense linears: `MXFP8LinearConverter` in every arm
-- torch `2.14.0a0`, torchao at the kernel PRs' heads, application clocks 2062 MHz
-
-`"grouped_gemm_swiglu"`; the `"none"`, pad 256 arm isolates the cost of the
-256-row padding the cuDNN kernels require from the fusion gain:
+DeepSeek-V3 16B (`deepseek_v3_16b` with both MXFP8 converters), 4x GB200,
+FSDP=4, EP=4, TP=1, `--debug.seed 42`, `--debug.moe_force_load_balance`, all arms
+from one checkpoint, median tokens/s over steps 11-50, eager (unlike the tables
+above these runs are not compiled, so only the relative numbers are meaningful).
+The `"none"`, pad 256 arm isolates the cost of the 256-row padding the cuDNN
+kernels require from the fusion gain:
 
 | Local batch | `"none"`, pad 128 (default) | `"none"`, pad 256 | `"grouped_gemm_swiglu"`, pad 256 | vs default | vs pad 256 |
 |---|---|---|---|---|---|
@@ -368,19 +363,14 @@ runs are not compiled, so only the relative numbers are meaningful.
 | 8 | 18706 | 17882 | 18783 | +0.4% | +5.0% |
 
 Loss parity: the two `"none"` arms are identical to 5 decimals at every step;
-`"grouped_gemm_swiglu"` vs `"none"` at pad 256 differs by at most 2.5e-4 over
-steps 1-10 and 3.2e-3 over steps 11-50. Peak memory 94.1 GiB vs 87.1 GiB at
-local batch 4 (the packed gate/up weight copy and the kernels' BF16 activation).
+`"grouped_gemm_swiglu"` vs `"none"` at pad 256 differs by at most 3.2e-3 over
+steps 11-50. Peak memory 94.1 GiB vs 87.1 GiB at local batch 4.
 
-`"swiglu"` at `pad_multiple=128`, local batch 4, n=4 logged samples per arm:
-
-| `"none"`, pad 128 (default) | `"swiglu"`, pad 128 | vs default |
-|---|---|---|
-| 21031 (380.8 TFLOPS) | 21563 (390.4 TFLOPS) | +2.5% |
-
-Loss parity for `"swiglu"`: over 3 seeds x 500 steps the mean loss difference to
-the unfused arm stays within the unfused arm's seed-to-seed standard deviation
-(8.4e-3); kernel-level comparisons are in pytorch/ao#4743.
+`"swiglu"` was measured separately (compiled, on the kernel's original
+integration branch, so its baseline is not comparable to the table above):
++2.5% tokens/s over `"none"` at pad 128, local batch 4 (n=4). Its mean loss over
+3 seeds x 500 steps stays within the unfused arm's seed-to-seed standard
+deviation (8.4e-3). Kernel-level comparisons: pytorch/ao#4743, pytorch/ao#4820.
 
 #### Dense model convergence
 
@@ -421,7 +411,6 @@ All distributed communication for MXFP8 training is currently done in high preci
 ### Known Limitations
 - Currently in prototype stage - no BC guarantees.
 - Requires torch nightly - important bug fixes have landed since 2.9.1
-- Fusion plans apply to routed experts only; dense `MXFP8Linear` MLPs are unfused.
 - Fusion plans require unreleased torchao kernels (pytorch/ao#4743, pytorch/ao#4820).
 
 ### Additional Resources

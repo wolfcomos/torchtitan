@@ -97,7 +97,7 @@ class GroupedExperts(Module):
 
         return self._grouped_mlp(
             x_RD=x_RD, w1_EFD=w1_EFD, w2_EDF=w2_EDF, w3_EFD=w3_EFD, offsets_E=offsets_E
-        ).type_as(x_RD)
+        )
 
     def _grouped_mlp(
         self,
@@ -108,11 +108,9 @@ class GroupedExperts(Module):
         w3_EFD: torch.Tensor,
         offsets_E: torch.Tensor,
     ) -> torch.Tensor:
-        """SwiGLU expert MLP ``silu(x @ w1.T) * (x @ w3.T) @ w2.T`` over the routed rows.
-
-        Each grouped GEMM goes through ``_grouped_mm``. Overridable seam for
-        variants that fuse across the GEMMs (e.g. the MXFP8 converter's fusion
-        plans replace the whole MLP with one composite).
+        """SwiGLU expert MLP ``silu(x @ w1.T) * (x @ w3.T) @ w2.T`` over the routed
+        rows, in ``x_RD``'s dtype. Each grouped GEMM goes through ``_grouped_mm``;
+        overridable seam for variants that fuse across the GEMMs.
         """
         h_RF = F.silu(
             self._grouped_mm(A=x_RD.bfloat16(), weight_EOI=w1_EFD, offs=offsets_E)
@@ -120,7 +118,7 @@ class GroupedExperts(Module):
         h_RF = h_RF * self._grouped_mm(
             A=x_RD.bfloat16(), weight_EOI=w3_EFD, offs=offsets_E
         )
-        return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E)
+        return self._grouped_mm(A=h_RF, weight_EOI=w2_EDF, offs=offsets_E).type_as(x_RD)
 
     def _grouped_mm(
         self, *, A: torch.Tensor, weight_EOI: torch.Tensor, offs: torch.Tensor

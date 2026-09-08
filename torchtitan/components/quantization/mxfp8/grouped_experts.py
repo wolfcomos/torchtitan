@@ -6,20 +6,11 @@
 
 """Fused MXFP8 SwiGLU MLPs for routed experts.
 
-Two fusion plans over the stock expert MLP ``silu(x @ w1.T) * (x @ w3.T) @ w2.T``,
-``swiglu`` and ``grouped_gemm_swiglu``, selected by
-``MXFP8GroupedExpertsConverter.Config.fusion_plan`` (which documents what each
-plan fuses and which torchao kernels run it) and run through the
-``GroupedExperts._grouped_mlp`` seam.
-
-Both composites take plain BF16 CUDA tensors in expert-major padded row order:
-``x_RD`` with every expert's token group zero-padded to the plan's row multiple
-(128 for ``swiglu``, 256 for ``grouped_gemm_swiglu``; the padded token
-dispatcher provides it), ``offsets_E`` as the int32 exclusive-end cumsum of the
-padded group sizes, and the gate/up weights packed at call time from the stock
-``w1_EFD``/``w3_EFD`` parameters, so weight gradients land on the stock
-parameters and checkpoints stay stock. Configurations the kernels cannot
-execute raise; there is no silent fallback.
+The autograd composites behind the ``swiglu`` and ``grouped_gemm_swiglu`` plans
+of ``MXFP8GroupedExpertsConverter`` (its ``Config.fusion_plan`` documents what
+each plan fuses and which torchao kernels run it). Called from the converter's
+``GroupedExperts._grouped_mlp`` override with BF16 CUDA tensors whose expert
+token groups are padded to the plan's row multiple.
 
 Tensor shape suffixes:
     R: routed token rows (padded)
@@ -32,6 +23,7 @@ import spmd_types as spmd
 import torch
 
 from torchao.prototype.moe_training.kernels.mxfp8 import (
+    mxfp8_quantize_cuda_3d,
     triton_mx_block_rearrange_2d_K_groups,
     triton_mx_block_rearrange_per_group_3d,
 )
@@ -48,7 +40,7 @@ from torchao.prototype.mx_formats.mx_tensor import MXTensor
 from torchao.prototype.mx_formats.utils import _to_mxfp8_dim1_kernel_wrapper, to_blocked
 from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
 
-from .converter import _FUSED_DIM_ALIGNMENT
+from .converter import _FUSED_DIM_ALIGNMENT, _FUSION_PLAN_PAD_MULTIPLES
 from .tensor import _MXFP8_BLOCK_SIZE
 
 
@@ -72,12 +64,6 @@ def _wrap_rowwise(qdata, scales, orig_dtype):
 
 
 def _swiglu_forward_casts(gated):
-    """SwiGLU of the ``[gate | up]`` GEMM output plus its rowwise and
-    columnwise MXFP8 casts, in one kernel.
-
-    Returns ``(h_rowwise_qdata, h_colwise_qdata, h_rowwise_scales,
-    h_colwise_scales)``.
-    """
     # Lazy: the kernel module imports the CuTe DSL runtime at module scope.
     from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8 import (
         gated_act_mxfp8_cutedsl_forward,
@@ -87,12 +73,6 @@ def _swiglu_forward_casts(gated):
 
 
 def _swiglu_backward_casts(grad_h, gated):
-    """Gradient of the SwiGLU w.r.t. its ``[gate | up]`` input plus its
-    rowwise and columnwise MXFP8 casts, in one kernel.
-
-    Returns ``(d_rowwise_qdata, d_colwise_qdata, d_rowwise_scales,
-    d_colwise_scales)``.
-    """
     from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8 import (
         gated_act_mxfp8_cutedsl_backward,
     )
@@ -207,55 +187,42 @@ class _MXFP8SwiGLUFusionFunction(torch.autograd.Function):
         return grad_x_RD, grad_w13_E2FD, grad_w2_t_EFD, None
 
 
-# Marks the function local-only so SPMD type checking can propagate through
-# an autograd function it cannot see into.
-# TODO(anijain2305, pianpwk): drop this once register_local_autograd_function
-# is removed tree-wide (see the same note on _MXFP8LinearFunction).
+# Local-only for SPMD type checking; see the note on _MXFP8LinearFunction.
 spmd.register_local_autograd_function(_MXFP8SwiGLUFusionFunction)
 
 
-def _validate_swiglu_inputs(x_RD, w1_EFD, w2_t_EFD):
-    """Static-shape checks for the ``swiglu`` plan at the module's forward.
-
-    The caller guarantees plain local BF16 CUDA tensors in the module's own
-    shapes; only the expert dimensions (local shards under tensor parallelism)
-    and the routing-dependent token count need checking.
-    """
+def _validate_inputs(x_RD, w1_EFD, fusion_plan):
+    """Static-shape checks at the module's forward: the local expert dims
+    (shards under tensor parallelism) and the routing-dependent token count."""
     _, f, d = w1_EFD.shape
-    m = x_RD.shape[0]
-    d_out = w2_t_EFD.shape[2]
-    if (
-        f % _FUSED_DIM_ALIGNMENT != 0
-        or d % _FUSED_DIM_ALIGNMENT != 0
-        or d_out % _FUSED_DIM_ALIGNMENT != 0
-    ):
+    if f % _FUSED_DIM_ALIGNMENT or d % _FUSED_DIM_ALIGNMENT:
         raise ValueError(
-            "MXFP8 fusion_plan='swiglu' requires the local expert dimensions to "
-            f"be multiples of {_FUSED_DIM_ALIGNMENT}, got hidden_dim={f}, dim={d}, "
-            f"out_dim={d_out}. Choose a tensor_parallel_degree that keeps the "
-            "shards aligned, or use fusion_plan='none' for this model."
+            f"MXFP8 fusion_plan={fusion_plan!r} requires the local expert "
+            f"dimensions to be multiples of {_FUSED_DIM_ALIGNMENT}, got "
+            f"hidden_dim={f}, dim={d}. Choose a tensor_parallel_degree that "
+            "keeps the shards aligned, or use fusion_plan='none' for this model."
         )
-    # Group boundaries must additionally be 128-row aligned (the dispatcher's
-    # pad_multiple guarantees it); checking offs here would sync. M is
-    # routing-dependent under compile (an unbacked SymInt), so the M
-    # conditions use identity tests: literal bools raise immediately,
-    # symbolic ones become deferred runtime asserts. The m >= 128 and m % 32
-    # forms are redundant with m % 128 but recorded separately: downstream
-    # kernel wrappers and GEMM metas check exactly those forms, and the
-    # symbolic engine matches expressions rather than deriving them from
-    # mod-128.
+    # Group boundaries must also be aligned (the dispatcher's pad_multiple
+    # guarantees it; checking offs here would sync). M is an unbacked SymInt
+    # under compile, so identity tests: literal bools raise, SymBools become
+    # deferred runtime asserts. The >= and % 32 forms are implied by the row
+    # multiple but recorded separately: downstream kernel wrappers and GEMM
+    # metas check exactly those forms, and the symbolic engine matches
+    # expressions rather than deriving them.
+    rows = _FUSION_PLAN_PAD_MULTIPLES[fusion_plan]
+    m = x_RD.shape[0]
     for cond, requirement in (
-        (m >= 128, "at least 128"),
+        (m >= rows, f"at least {rows}"),
         (
-            m % 128 == 0,
-            "a multiple of 128 (configure the token dispatcher with "
-            "pad_multiple=128)",
+            m % rows == 0,
+            f"a multiple of {rows} (configure the token dispatcher with "
+            f"pad_multiple={rows})",
         ),
-        (m % 32 == 0, "a multiple of 32"),
+        (m % _MXFP8_BLOCK_SIZE == 0, f"a multiple of {_MXFP8_BLOCK_SIZE}"),
     ):
         if cond is False:
             raise ValueError(
-                f"MXFP8 fusion_plan='swiglu': token count {m} must be "
+                f"MXFP8 fusion_plan={fusion_plan!r}: token count {m} must be "
                 f"{requirement}; there is no silent fallback."
             )
         if cond is not True:
@@ -289,63 +256,29 @@ def _cast_weight_rowwise_3d(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
 
 
 def _cast_weight_colwise_3d(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``[E, N, K]`` quantized along N: k-major per-group qdata + per-group
-    blocked scales for logical ``(K, N/32)``.
-
-    Batched: ONE (32x1 RCEIL) cast of the flat ``[E*N, K]`` view along dim0
-    + ONE ``K_groups`` swizzle with uniform scale-column offsets. Exact
-    because N is a 256-multiple, so 32-row quantization blocks never
-    straddle groups, and every group's N/32 scale columns are 4-multiples,
-    so the swizzle packs the same per-group ``to_blocked`` bytes densely
-    from the buffer start (bitwise-equal to a per-group loop, at a fraction
-    of the launches).
-
-    The cast's native ``[E, N, K]`` view carries an interleaved batch
-    stride ``(N, 1, E*N)``, which the fused-op wrappers reject (B must be
-    per-group-contiguous, k- or n-major); one fp8 repack to k-major -- the
-    same major the rowwise casts pass -- restores an accepted layout.
-    """
-    e, n, k = w.shape
-    mx = _to_mxfp8_dim1_kernel_wrapper(
-        w.reshape(e * n, k),
+    """``[E, N, K]`` quantized along N (torchao's 3D dim1 cast, as in its
+    grouped dgrad): per-expert column-major qdata + per-group blocked scales
+    for logical ``(K, N/32)`` -- the ops' colwise ``b`` contract, taken as-is
+    by the bwd op and transposed for the mm op."""
+    return mxfp8_quantize_cuda_3d(
+        w,
         _MXFP8_BLOCK_SIZE,
-        elem_dtype=_ELEM_DTYPE,
-        hp_dtype=w.dtype,
-        kernel_preference=_KERNEL_PREFERENCE,
-        cast_kernel_choice=MXFP8Dim1CastKernelChoice.CUDA,
-        scale_calculation_mode=_SCALE_MODE,
+        scale_block_dim1=_MXFP8_BLOCK_SIZE,
+        scale_block_dim2=1,
+        scaling_mode=_SCALE_MODE.value,
     )
-    scale_offsets = torch.arange(1, e + 1, device=w.device, dtype=torch.int32) * (
-        n // _MXFP8_BLOCK_SIZE
-    )
-    col_scales = triton_mx_block_rearrange_2d_K_groups(
-        mx.scale, _pad_offsets_pow2(scale_offsets)
-    )
-    k_pad = -(-k // 128) * 128
-    flat = col_scales.reshape(-1)[: k_pad * (e * n // _MXFP8_BLOCK_SIZE)]
-    qdata = mx.qdata.view(k, e, n).permute(1, 2, 0).contiguous()
-    return qdata, flat.view(e, -1)
 
 
 def _cast_colwise_grouped(
     t: torch.Tensor, offsets: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Ragged colwise (32x1) RCEIL cast of ``[R, N]`` for the wgrad operands:
-    torchao-native qdata (``[R, N]``-logical, ``(1, R)`` strides -- the fused
-    wgrad kernel accepts this major directly) + PER-GROUP blocked scales via
-    ``triton_mx_block_rearrange_2d_K_groups``.
-
-    Quantizing the whole ragged tensor in one launch is safe ONLY because
-    every per-expert row count is a 256-multiple, so 32-row quantization
-    blocks never straddle an expert boundary.
-
-    The swizzle output carries 4 trailing padding columns per group slot
-    (d2h-sync avoidance); with 256-multiple groups the real blocks pack densely
-    from the start of the buffer, so the flat buffer is statically sliced to
-    ``round_up(N, 128) * R / 32`` -- the op's documented allocated-row sizing --
-    without any device sync; the wgrad kernel never reads past the
-    offsets-bounded span.
-    """
+    """Ragged colwise (32x1) cast of ``[R, N]`` for the wgrad operands: qdata
+    ``[R, N]``-logical with ``(1, R)`` strides (the dim1 wrapper hands back the
+    ``[N, R]`` view, hence the ``.t()``) plus PER-GROUP blocked scales. One
+    launch over the ragged tensor is exact because every group is a
+    256-multiple (32-row blocks never straddle experts); the swizzle's trailing
+    per-group padding span is dropped by the static slice to the op's
+    ``N * R/32`` sizing, without a device sync."""
     mx = _to_mxfp8_dim1_kernel_wrapper(
         t,
         _MXFP8_BLOCK_SIZE,
@@ -359,27 +292,21 @@ def _cast_colwise_grouped(
         mx.scale, _pad_offsets_pow2(offsets // _MXFP8_BLOCK_SIZE)
     )
     r, n = t.shape
-    n_pad = -(-n // 128) * 128
-    # mx.qdata is [N, R]-shaped; .t() presents the op's [R, N]-logical view.
-    return mx.qdata.t(), col_scales.reshape(-1)[: n_pad * (r // _MXFP8_BLOCK_SIZE)]
+    return mx.qdata.t(), col_scales.reshape(-1)[: n * (r // _MXFP8_BLOCK_SIZE)]
 
 
 @torch._dynamo.allow_in_graph
 class _MXFP8GroupedGemmSwiGLUFusionFunction(torch.autograd.Function):
     """``x_RD [R, D] -> y_RD [R, D]`` over the four fused cuDNN grouped-GEMM ops.
 
-    ``w13_E2FD`` is ``(E, 2F, D)`` in 32-block GLU row order (32 gate rows,
-    then the same features' 32 up rows, ...); ``w2_EDF`` is the stock down
-    weight; ``offsets_E`` holds int32 exclusive-end row offsets of the
-    256-row-padded groups, ``offsets_E[-1] <= R``. Rows past ``offsets_E[-1]``
-    of ``y_RD`` (and of ``grad_x_RD``) are left unwritten.
-
-    All backward-only casts are lazy: forward quantizes only what forward
-    consumes (the rowwise views); backward requantizes the colwise weight
-    views and the colwise ``x`` from the saved BF16 references -- safe because
-    the same-step backward always precedes the optimizer update (an update in
-    between trips the autograd version counter), and cheaper under per-op
-    activation checkpointing because the forward re-runs in the recompute pass.
+    ``w13_E2FD`` is ``(E, 2F, D)`` in 32-block GLU row order (see
+    ``_pack_w13_blocks``); ``w2_EDF`` is the stock down weight; ``offsets_E``
+    holds int32 exclusive-end offsets of the 256-row-padded groups,
+    ``offsets_E[-1] <= R``; rows past it in ``y_RD``/``grad_x_RD`` are unwritten.
+    Forward quantizes only the rowwise views; backward recasts the colwise
+    weight views and ``x`` from the saved BF16 tensors (safe: the same-step
+    backward precedes the optimizer update, and cheaper under per-op
+    activation checkpointing, where forward re-runs in the recompute pass).
     """
 
     @staticmethod
@@ -400,8 +327,7 @@ class _MXFP8GroupedGemmSwiGLUFusionFunction(torch.autograd.Function):
             offsets_E,
         )
         w2_row_q, w2_row_sf = _cast_weight_rowwise_3d(w2_EDF)
-        # Down GEMM: b [E, N=D, K=F] rowwise (quantized along F = the
-        # contraction), row-major as cast.
+        # Down GEMM: b = w2 rowwise [E, N=D, K=F], quantized along F.
         y_RD = mxfp8_grouped_gemm_cudnn(
             h_row_q,
             h_row_sf,
@@ -424,8 +350,7 @@ class _MXFP8GroupedGemmSwiGLUFusionFunction(torch.autograd.Function):
         z, h_col_q, h_col_sf, x_RD, offsets_E, w13_E2FD, w2_EDF = ctx.saved_tensors
         grad_y_RD = grad_y_RD.contiguous()
         dy_row_q, dy_row_sf = _cast_rowwise(grad_y_RD)
-        # w2 colwise (quantized along D = the dgrad contraction): the bwd op's
-        # ABI takes the [E, D, F]-logical cast output as-is.
+        # w2 colwise (quantized along D, the dgrad contraction), as cast.
         w2_col_q, w2_col_sf = _cast_weight_colwise_3d(w2_EDF)
         dz_row_q, dz_row_sf, dz_col_q, dz_col_sf = mxfp8_grouped_gemm_dswiglu_bwd_cudnn(
             dy_row_q,
@@ -435,10 +360,8 @@ class _MXFP8GroupedGemmSwiGLUFusionFunction(torch.autograd.Function):
             z,
             offsets_E,
         )
-        # Up/gate dgrad: b [E, N=D, K=2F] quantized along 2F. The colwise cast
-        # yields [E, 2F, D]; the mm op's b orientation is [E, N, K], so the
-        # call site transposes (unlike ``torch._scaled_grouped_mm``, whose
-        # [E, K, N] mat2 convention would take the cast output as-is).
+        # Up/gate dgrad: w13 colwise casts to [E, 2F, D]; transpose into the
+        # op's [E, N=D, K=2F] b orientation.
         w13_col_q, w13_col_sf = _cast_weight_colwise_3d(w13_E2FD)
         grad_x_RD = mxfp8_grouped_gemm_cudnn(
             dz_row_q,
@@ -449,9 +372,8 @@ class _MXFP8GroupedGemmSwiGLUFusionFunction(torch.autograd.Function):
         )
         dy_col_q, dy_col_sf = _cast_colwise_grouped(grad_y_RD, offsets_E)
         x_col_q, x_col_sf = _cast_colwise_grouped(x_RD, offsets_E)
-        # grad_w2 [E, D, F] = dy^T @ h per expert; grad_w13 [E, 2F, D] =
-        # dz^T @ x per expert, landing directly in the 32-block w13 operand
-        # order.
+        # grad_w2 [E, D, F] = dy^T @ h; grad_w13 [E, 2F, D] = dz^T @ x, already
+        # in the 32-block w13 order.
         grad_w2_EDF = mxfp8_grouped_gemm_wgrad_cudnn(
             dy_col_q, dy_col_sf, h_col_q, h_col_sf, offsets_E
         )
@@ -461,10 +383,7 @@ class _MXFP8GroupedGemmSwiGLUFusionFunction(torch.autograd.Function):
         return grad_x_RD, grad_w13_E2FD, grad_w2_EDF, None
 
 
-# Marks the function local-only so SPMD type checking can propagate through
-# an autograd function it cannot see into.
-# TODO(anijain2305, pianpwk): drop this once register_local_autograd_function
-# is removed tree-wide (see the same note on _MXFP8LinearFunction).
+# Local-only for SPMD type checking; see the note on _MXFP8LinearFunction.
 spmd.register_local_autograd_function(_MXFP8GroupedGemmSwiGLUFusionFunction)
 
 
@@ -479,44 +398,3 @@ def _pack_w13_blocks(w1_EFD: torch.Tensor, w3_EFD: torch.Tensor) -> torch.Tensor
         .permute(0, 1, 3, 2, 4)
         .reshape(e, 2 * f, d)
     )
-
-
-def _validate_grouped_gemm_inputs(x_RD: torch.Tensor, w1_EFD: torch.Tensor) -> None:
-    """Static-shape checks for the ``grouped_gemm_swiglu`` plan at the
-    module's forward.
-
-    The converter validates the GLOBAL dims at config time; the LOCAL shard
-    dims are only known here (under dense tensor parallelism the weights are
-    Shard-split on hidden_dim). The total row count is checked against the
-    256-row contract with the same identity-test / ``torch._check`` idiom as
-    the ``swiglu`` plan; the per-group alignment is the padded dispatcher's
-    guarantee (the cuDNN ops do not validate, and 128-only groups corrupt
-    silently).
-    """
-    local_f, local_d = w1_EFD.shape[1], w1_EFD.shape[2]
-    if local_f % _FUSED_DIM_ALIGNMENT != 0 or local_d % _FUSED_DIM_ALIGNMENT != 0:
-        raise ValueError(
-            "MXFP8 fusion_plan='grouped_gemm_swiglu' requires the local expert "
-            f"dimensions to be multiples of {_FUSED_DIM_ALIGNMENT}, got hidden_dim="
-            f"{local_f}, dim={local_d} from w1_EFD of local shape "
-            f"{tuple(w1_EFD.shape)}. Choose a tensor_parallel_degree that "
-            "keeps hidden_dim / tp aligned, or use fusion_plan='none' for this "
-            "model."
-        )
-    m = x_RD.shape[0]
-    for cond, requirement in (
-        (m >= 256, "at least 256"),
-        (
-            m % 256 == 0,
-            "a multiple of 256 (configure the token dispatcher with "
-            "pad_multiple=256)",
-        ),
-        (m % 32 == 0, "a multiple of 32"),
-    ):
-        if cond is False:
-            raise ValueError(
-                f"MXFP8 fusion_plan='grouped_gemm_swiglu': token count {m} must "
-                f"be {requirement}; there is no silent fallback."
-            )
-        if cond is not True:
-            torch._check(cond)
