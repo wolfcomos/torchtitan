@@ -183,30 +183,6 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
             recipe_name: str = "mxfp8_rceil"
             fusion_plan: FusionPlan = "none"
 
-            def __post_init__(self) -> None:
-                if self.fusion_plan not in _FUSION_PLANS:
-                    raise ValueError(
-                        f"MXFP8 fusion_plan must be one of {_FUSION_PLANS}; got "
-                        f"{self.fusion_plan!r}."
-                    )
-                if self.fusion_plan == "none":
-                    return
-                # The fused kernels quantize with RCEIL scales internally.
-                if self.recipe_name != "mxfp8_rceil":
-                    raise ValueError(
-                        f"MXFP8 fusion_plan={self.fusion_plan!r} supports only "
-                        f"recipe_name='mxfp8_rceil'; got {self.recipe_name!r}."
-                    )
-                # The fused composites implement the stock SwiGLU MLP; other
-                # experts modules (GptOssGroupedExperts: biases, clamped SwiGLU)
-                # keep the per-GEMM quantization.
-                if parent_cls is not GroupedExperts:
-                    raise ValueError(
-                        f"MXFP8 fusion_plan={self.fusion_plan!r} supports only "
-                        f"GroupedExperts, not {parent_cls.__name__}; use "
-                        "fusion_plan='none' for this model."
-                    )
-
         def __init__(self, config: Config):
             super().__init__(config)
             from torchao.prototype.moe_training.config import (
@@ -308,8 +284,10 @@ class MXFP8GroupedExpertsConverter(QuantizationConverter):
           kernels' fixed group padding) and ``dim`` / ``hidden_dim`` multiples
           of 128.
 
-        Both fused plans support only the stock ``GroupedExperts`` and raise at
-        config time otherwise; there is no silent fallback.
+        Both fused plans implement the stock ``GroupedExperts`` SwiGLU MLP and
+        quantize with RCEIL scales; ``GptOssGroupedExperts`` (biases, clamped
+        SwiGLU) does not reach the ``_grouped_mlp`` seam and keeps the per-GEMM
+        path.
         """
 
         def __post_init__(self) -> None:

@@ -703,37 +703,6 @@ def test_mxfp8_grouped_experts_config_defaults_to_fusion_plan_none(parent_cls):
 
 
 @pytest.mark.parametrize(
-    "parent_cls, overrides, match",
-    [
-        pytest.param(
-            GroupedExperts, {"fusion_plan": "missing"}, "must be one of", id="unknown"
-        ),
-        pytest.param(
-            GptOssGroupedExperts,
-            {"fusion_plan": "swiglu"},
-            "not GptOssGroupedExperts",
-            id="gpt-oss-parent",
-        ),
-        pytest.param(
-            GroupedExperts,
-            {"fusion_plan": "swiglu", "recipe_name": "mxfp8_floor"},
-            "recipe_name='mxfp8_rceil'",
-            id="recipe",
-        ),
-    ],
-)
-def test_mxfp8_grouped_experts_config_rejects_unsupported_fusion_plans(
-    parent_cls, overrides, match
-):
-    """The fused composites implement the stock SwiGLU MLP with RCEIL scales
-    over 128-aligned expert dims; anything else is rejected at config time
-    rather than falling back silently."""
-    config_cls = _get_mxfp8_grouped_experts_cls(parent_cls).Config
-    with pytest.raises(ValueError, match=match):
-        config_cls(**{"dim": 128, "hidden_dim": 256, "num_experts": 2, **overrides})
-
-
-@pytest.mark.parametrize(
     "fusion_plan, pad_multiple, match",
     [
         pytest.param("missing", 128, "must be one of", id="unknown"),
