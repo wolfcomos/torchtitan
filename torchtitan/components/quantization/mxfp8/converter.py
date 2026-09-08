@@ -206,9 +206,9 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
             from . import grouped_experts
 
             # Casts stay outside the composites so autograd covers high-precision
-            # master weights; the packed gate/up operand is a differentiable copy
-            # of the stock parameters. The output takes ``x_RD``'s dtype like the
-            # stock MLP.
+            # master weights; the cuDNN plan's packed gate/up operand is a
+            # differentiable copy of the stock parameters. The output takes
+            # ``x_RD``'s dtype like the stock MLP.
             x_bf16_RD = x_RD.bfloat16()
             w1_EFD, w2_EDF, w3_EFD = (
                 w1_EFD.bfloat16(),
@@ -219,7 +219,8 @@ def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
             if self.fusion_plan == "swiglu":
                 out_RD = grouped_experts._MXFP8SwiGLUFusionFunction.apply(
                     x_bf16_RD,
-                    torch.cat([w1_EFD, w3_EFD], dim=1),
+                    w1_EFD,
+                    w3_EFD,
                     w2_EDF.transpose(-2, -1),
                     offsets_E,
                 )

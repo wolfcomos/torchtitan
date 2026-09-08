@@ -245,7 +245,7 @@ selects a fused alternative for the routed-expert MLP `silu(x @ w1.T) * (x @ w3.
 | `fusion_plan` | What runs fused | torchao kernels | `pad_multiple` | Expert dims |
 |---|---|---|---|---|
 | `"none"` (default) | nothing: three quantized grouped GEMMs, BF16 SwiGLU | `_quantize_then_scaled_grouped_mm` | any multiple of 32 (128 on SM100) | multiples of 32 |
-| `"swiglu"` | the SwiGLU and both MXFP8 quantizations of its output (rowwise for the down GEMM, columnwise for the down weight gradient) in one CuTeDSL kernel; the two grouped GEMMs stay separate | `cutedsl_gated_act_mxfp8` ([pytorch/ao#4743](https://github.com/pytorch/ao/pull/4743)) | multiple of 128 | multiples of 128 |
+| `"swiglu"` | the SwiGLU and both MXFP8 quantizations of its output (rowwise for the down GEMM, columnwise for the down weight gradient) in one CuTeDSL kernel; the three grouped GEMMs stay separate | `cutedsl_gated_act_mxfp8` ([pytorch/ao#4743](https://github.com/pytorch/ao/pull/4743)) | multiple of 128 | multiples of 128 |
 | `"grouped_gemm_swiglu"` | grouped GEMM + SwiGLU + MXFP8 quantization in one cuDNN kernel per direction (forward, activation gradient, weight gradient) | `cudnn_grouped_mlp` ([pytorch/ao#4820](https://github.com/pytorch/ao/pull/4820)) | multiple of 256 | multiples of 128 |
 
 ```python
@@ -259,9 +259,11 @@ MXFP8GroupedExpertsConverter.Config(
 Example flavors: `deepseek_v3_debugmodel_mxfp8_swiglu_fusion` and
 `deepseek_v3_debugmodel_mxfp8_grouped_gemm_swiglu_fusion`.
 
-Both fused plans keep the stock `w1_EFD` / `w2_EDF` / `w3_EFD` parameters and pack
-the gate and up weights into the kernel layout at forward time, so checkpoints
-and initialization are identical to the unfused converter. They require
+Both fused plans keep the stock `w1_EFD` / `w2_EDF` / `w3_EFD` parameters, so
+checkpoints and initialization are identical to the unfused converter:
+`"swiglu"` runs the stock three grouped GEMMs (gate, up, down) and fuses only
+the activation boundary; `"grouped_gemm_swiglu"` packs the gate and up weights
+into the kernel layout at forward time. They require
 `recipe_name="mxfp8_rceil"` (the kernels quantize with RCEIL scales) and are
 numerically close to, but not bitwise equal to, `fusion_plan="none"` (see
 [MoE models](#moe-models)).

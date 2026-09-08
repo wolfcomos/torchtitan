@@ -23,6 +23,7 @@ import spmd_types as spmd
 import torch
 
 from torchao.prototype.moe_training.kernels.mxfp8 import (
+    mxfp8_quantize_2d_1x32_cutedsl,
     mxfp8_quantize_cuda_3d,
     triton_mx_block_rearrange_2d_K_groups,
     triton_mx_block_rearrange_per_group_3d,
@@ -63,21 +64,23 @@ def _wrap_rowwise(qdata, scales, orig_dtype):
     )
 
 
-def _swiglu_forward_casts(gated):
+def _swiglu_forward_casts(gate, up):
     # Lazy: the kernel module imports the CuTe DSL runtime at module scope.
     from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8 import (
         gated_act_mxfp8_cutedsl_forward,
     )
 
-    return gated_act_mxfp8_cutedsl_forward(gated, rowwise=True, colwise=True)
+    return gated_act_mxfp8_cutedsl_forward(gate, up, rowwise=True, colwise=True)
 
 
-def _swiglu_backward_casts(grad_h, gated):
+def _swiglu_backward_casts(grad_h, gate, up):
     from torchao.prototype.moe_training.kernels.mxfp8.cutedsl_gated_act_mxfp8 import (
         gated_act_mxfp8_cutedsl_backward,
     )
 
-    return gated_act_mxfp8_cutedsl_backward(grad_h, gated, rowwise=True, colwise=True)
+    return gated_act_mxfp8_cutedsl_backward(
+        grad_h, gate, up, rowwise=True, colwise=True
+    )
 
 
 def _reblock_scales_k_groups(scales, n_rows, m_total, offs):
@@ -103,12 +106,10 @@ def _reblock_scales_k_groups(scales, n_rows, m_total, offs):
     return scales.view(rb * cb, 512)[src].view(n_rows, -1)
 
 
-def _wgrad_k_groups(a_qdata, a_scales, b, offs, out_dtype):
-    # grad[e] = a[start:end].T @ b[start:end] for each token group. `a` arrives
-    # colwise-quantized from the SwiGLU boundary ((M, Ka) with strides (1, M)
-    # plus flat blocked scales); `b` gets the same GEMM-operand colwise cast the
-    # existing grouped wgrad path uses.
-    m, ka = a_qdata.shape
+def _cast_colwise_k_groups(b, offs):
+    # The GEMM-operand colwise cast the existing grouped wgrad path uses, for
+    # the `b` side of `_wgrad_k_groups`: (M, Kb) -> qdata (Kb, M) plus per-token-
+    # group blocked scales. Cast once when one operand feeds several wgrads.
     b_t_mx = _to_mxfp8_dim1_kernel_wrapper(
         b,
         _MXFP8_BLOCK_SIZE,
@@ -121,10 +122,20 @@ def _wgrad_k_groups(a_qdata, a_scales, b, offs, out_dtype):
     b_scales = triton_mx_block_rearrange_2d_K_groups(
         b_t_mx.scale, offs // _MXFP8_BLOCK_SIZE
     )
+    return b_t_mx.qdata, b_scales
+
+
+def _wgrad_k_groups(a_qdata, a_scales, b_cast, offs, out_dtype):
+    # grad[e] = a[start:end].T @ b[start:end] for each token group. `a` arrives
+    # colwise-quantized from the SwiGLU boundary ((M, Ka) with strides (1, M)
+    # plus flat blocked scales); `b_cast` is `_cast_colwise_k_groups` of the
+    # other operand.
+    m, ka = a_qdata.shape
+    b_t_qdata, b_scales = b_cast
     a_scales_2d = _reblock_scales_k_groups(a_scales, ka, m, offs)
     return torch._scaled_grouped_mm(
         a_qdata.t(),
-        b_t_mx.qdata.transpose(-2, -1),
+        b_t_qdata.transpose(-2, -1),
         a_scales_2d,
         b_scales,
         offs=offs,
@@ -134,26 +145,40 @@ def _wgrad_k_groups(a_qdata, a_scales, b, offs, out_dtype):
 
 @torch._dynamo.allow_in_graph
 class _MXFP8SwiGLUFusionFunction(torch.autograd.Function):
-    """``x_RD [R, D] -> y_RD [R, D]`` over two MXFP8 grouped GEMMs with the
-    fused SwiGLU + cast kernel between them.
+    """``x_RD [R, D] -> y_RD [R, D]`` over the stock MLP's three MXFP8 grouped
+    GEMMs with the fused SwiGLU + cast kernel between them.
 
-    ``w13_E2FD`` is the gate and up weights concatenated per expert to
-    ``(E, 2F, D)``; ``w2_t_EFD`` is the down weight transposed to ``(E, F, D)``;
+    ``w1_EFD`` and ``w3_EFD`` are the stock gate and up weights ``(E, F, D)``;
+    ``w2_t_EFD`` is the down weight transposed to ``(E, F, D)``;
     ``offs_E`` holds int32 exclusive-end row offsets of the 128-row-padded groups.
     """
 
     @staticmethod
-    def forward(ctx, x_RD, w13_E2FD, w2_t_EFD, offs_E):
+    def forward(ctx, x_RD, w1_EFD, w3_EFD, w2_t_EFD, offs_E):
         x_RD = x_RD.contiguous()
-        gated = _compute_fwd_sm100(
-            x_RD,
-            w13_E2FD.transpose(-2, -1),
+        # The rowwise cast `_compute_fwd_sm100` would run on BF16 `x_RD`, hoisted
+        # so one cast feeds both the gate and the up GEMM.
+        x_q, x_scales = mxfp8_quantize_2d_1x32_cutedsl(
+            x_RD, scaling_mode=_SCALE_MODE.value.lower(), offs=offs_E
+        )
+        x_mx = _wrap_rowwise(x_q, x_scales, x_RD.dtype)
+        gate = _compute_fwd_sm100(
+            x_mx,
+            w1_EFD.transpose(-2, -1),
             offs_E,
             _MXFP8_BLOCK_SIZE,
             x_RD.dtype,
             _SCALE_MODE,
         )
-        h_rw, h_cw, hs_rw, hs_cw = _swiglu_forward_casts(gated)
+        up = _compute_fwd_sm100(
+            x_mx,
+            w3_EFD.transpose(-2, -1),
+            offs_E,
+            _MXFP8_BLOCK_SIZE,
+            x_RD.dtype,
+            _SCALE_MODE,
+        )
+        h_rw, h_cw, hs_rw, hs_cw = _swiglu_forward_casts(gate, up)
         y_RD = _compute_fwd_sm100(
             _wrap_rowwise(h_rw, hs_rw, x_RD.dtype),
             w2_t_EFD,
@@ -162,29 +187,65 @@ class _MXFP8SwiGLUFusionFunction(torch.autograd.Function):
             x_RD.dtype,
             _SCALE_MODE,
         )
-        ctx.save_for_backward(x_RD, w13_E2FD, w2_t_EFD, offs_E, gated, h_cw, hs_cw)
+        ctx.save_for_backward(
+            x_RD, w1_EFD, w3_EFD, w2_t_EFD, offs_E, gate, up, h_cw, hs_cw
+        )
         return y_RD
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_y_RD):
-        x_RD, w13_E2FD, w2_t_EFD, offs_E, gated, h_cw, hs_cw = ctx.saved_tensors
+        (
+            x_RD,
+            w1_EFD,
+            w3_EFD,
+            w2_t_EFD,
+            offs_E,
+            gate,
+            up,
+            h_cw,
+            hs_cw,
+        ) = ctx.saved_tensors
         grad_y_RD = grad_y_RD.contiguous()
         grad_h = _compute_dgrad_sm100(
             grad_y_RD, w2_t_EFD, offs_E, _MXFP8_BLOCK_SIZE, grad_y_RD.dtype, _SCALE_MODE
         )
-        d_rw, d_cw, ds_rw, ds_cw = _swiglu_backward_casts(grad_h, gated)
+        (
+            dgate_rw,
+            dgate_cw,
+            dgs_rw,
+            dgs_cw,
+            dup_rw,
+            dup_cw,
+            dus_rw,
+            dus_cw,
+        ) = _swiglu_backward_casts(grad_h, gate, up)
         grad_x_RD = _compute_dgrad_sm100(
-            _wrap_rowwise(d_rw, ds_rw, grad_y_RD.dtype),
-            w13_E2FD.transpose(-2, -1),
+            _wrap_rowwise(dgate_rw, dgs_rw, grad_y_RD.dtype),
+            w1_EFD.transpose(-2, -1),
+            offs_E,
+            _MXFP8_BLOCK_SIZE,
+            grad_y_RD.dtype,
+            _SCALE_MODE,
+        ) + _compute_dgrad_sm100(
+            _wrap_rowwise(dup_rw, dus_rw, grad_y_RD.dtype),
+            w3_EFD.transpose(-2, -1),
             offs_E,
             _MXFP8_BLOCK_SIZE,
             grad_y_RD.dtype,
             _SCALE_MODE,
         )
-        grad_w13_E2FD = _wgrad_k_groups(d_cw, ds_cw, x_RD, offs_E, grad_y_RD.dtype)
-        grad_w2_t_EFD = _wgrad_k_groups(h_cw, hs_cw, grad_y_RD, offs_E, grad_y_RD.dtype)
-        return grad_x_RD, grad_w13_E2FD, grad_w2_t_EFD, None
+        x_cast = _cast_colwise_k_groups(x_RD, offs_E)
+        grad_w1_EFD = _wgrad_k_groups(dgate_cw, dgs_cw, x_cast, offs_E, grad_y_RD.dtype)
+        grad_w3_EFD = _wgrad_k_groups(dup_cw, dus_cw, x_cast, offs_E, grad_y_RD.dtype)
+        grad_w2_t_EFD = _wgrad_k_groups(
+            h_cw,
+            hs_cw,
+            _cast_colwise_k_groups(grad_y_RD, offs_E),
+            offs_E,
+            grad_y_RD.dtype,
+        )
+        return grad_x_RD, grad_w1_EFD, grad_w3_EFD, grad_w2_t_EFD, None
 
 
 # Local-only for SPMD type checking; see the note on _MXFP8LinearFunction.

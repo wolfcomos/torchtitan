@@ -872,7 +872,7 @@ def test_mxfp8_fused_plans_hand_bf16_operands_and_int32_offsets_to_the_composite
         _module,
         x_RD,
         y_RD,
-        (x_arg, _w13, _w2, offsets_E),
+        (x_arg, *_weights, offsets_E),
     ) = _call_fused_plan_with_mocked_composite(monkeypatch, fusion_plan)
     # The casts stay outside the composite so autograd covers the master
     # weights; the composite sees BF16 activations and int32 exclusive-end
@@ -886,17 +886,18 @@ def test_mxfp8_fused_plans_hand_bf16_operands_and_int32_offsets_to_the_composite
     assert torch.equal(y_RD, torch.full_like(x_RD, 7.0))
 
 
-def test_mxfp8_swiglu_plan_concatenates_gate_and_up_weights(monkeypatch):
+def test_mxfp8_swiglu_plan_hands_the_stock_gate_and_up_weights(monkeypatch):
     (
         module,
         _x,
         _y,
-        (_x_arg, w13_E2FD, w2_t_EFD, _offsets),
+        (_x_arg, w1_EFD, w3_EFD, w2_t_EFD, _offsets),
     ) = _call_fused_plan_with_mocked_composite(monkeypatch, "swiglu")
-    # (E, 2F, D): every expert's gate rows, then its up rows.
-    assert w13_E2FD.shape == (3, 512, 128)
-    assert torch.equal(w13_E2FD[:, :256], module.w1_EFD.bfloat16())
-    assert torch.equal(w13_E2FD[:, 256:], module.w3_EFD.bfloat16())
+    # The stock (E, F, D) gate and up weights as cast, no packed copy; the down
+    # weight transposed to (E, F, D).
+    assert w1_EFD.shape == w3_EFD.shape == (3, 256, 128)
+    assert torch.equal(w1_EFD, module.w1_EFD.bfloat16())
+    assert torch.equal(w3_EFD, module.w3_EFD.bfloat16())
     assert torch.equal(w2_t_EFD, module.w2_EDF.bfloat16().transpose(-2, -1))
 
 
@@ -958,8 +959,9 @@ def test_mxfp8_plan_none_delegates_to_the_stock_grouped_mlp(monkeypatch):
 
 @pytest.mark.parametrize("fusion_plan", ["swiglu", "grouped_gemm_swiglu"])
 def test_mxfp8_fused_plans_keep_the_stock_parameters(fusion_plan):
-    """The fused plans pack gate/up weights at call time, so the parameter set
-    and checkpoint keys match stock ``GroupedExperts``."""
+    """The fused plans take the stock weights at call time (the cuDNN plan
+    packs a copy), so the parameter set and checkpoint keys match stock
+    ``GroupedExperts``."""
     pytest.importorskip("torchao")
     module_cls = _get_mxfp8_grouped_experts_cls(GroupedExperts)
 
