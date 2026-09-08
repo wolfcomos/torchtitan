@@ -1,0 +1,46 @@
+== arm_bf16: lines=192 validation=32; train samples per pv (pv<= 12): {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16, 9: 16}
+   distinct prompts per pv: {0: 8, 1: 8, 2: 8, 3: 8, 4: 8, 5: 8, 6: 8, 7: 8, 8: 8, 9: 8}
+== arm_nvfp4_deq: lines=192 validation=32; train samples per pv (pv<= 12): {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16, 9: 16}
+   distinct prompts per pv: {0: 8, 1: 8, 2: 8, 3: 8, 4: 8, 5: 8, 6: 8, 7: 8, 8: 8, 9: 8}
+== arm_bf16_4x4_long: lines=5260 validation=0; train samples per pv (pv<= 12): {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16, 9: 16, 10: 16, 11: 16, 12: 16}
+   distinct prompts per pv: {0: 8, 1: 8, 2: 8, 3: 8, 4: 8, 5: 8, 6: 8, 7: 8, 8: 8, 9: 8, 10: 8, 11: 8, 12: 8}
+== arm_nvfp4_deq_4x4_long: lines=5784 validation=0; train samples per pv (pv<= 12): {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16, 9: 16, 10: 16, 11: 16, 12: 16}
+   distinct prompts per pv: {0: 8, 1: 8, 2: 8, 3: 8, 4: 8, 5: 8, 6: 8, 7: 8, 8: 8, 9: 8, 10: 8, 11: 8, 12: 8}
+
+### prompt-set overlap by policy version (pv = step-1 presumably: pv0 rollouts train step 1)
+pv | ABLbf16∩ABLnvfp4 | LONGbf16∩LONGnvfp4 | ABLbf16∩LONGbf16 | ABLnvfp4∩LONGnvfp4 | sizes(ab,an,lb,ln)
+ 0 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 1 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 2 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 3 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 4 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 5 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 6 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 7 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 8 |  8 |  8 |  8 |  8 | (8,8,8,8)
+ 9 |  8 |  8 |  8 |  8 | (8,8,8,8)
+10 |  0 |  8 |  0 |  0 | (0,0,8,8)
+11 |  0 |  8 |  0 |  0 | (0,0,8,8)
+12 |  0 |  8 |  0 |  0 | (0,0,8,8)
+
+### ablation prompt -> which pv in long run (union of long runs)
+arm_bf16 pv0: 8/8 prompts found in long runs at pvs [0]
+arm_bf16 pv1: 8/8 prompts found in long runs at pvs [1]
+arm_bf16 pv2: 8/8 prompts found in long runs at pvs [2]
+arm_bf16 pv3: 8/8 prompts found in long runs at pvs [3]
+arm_bf16 pv4: 8/8 prompts found in long runs at pvs [4]
+arm_bf16 pv5: 8/8 prompts found in long runs at pvs [5]
+arm_bf16 pv6: 8/8 prompts found in long runs at pvs [6]
+arm_bf16 pv7: 8/8 prompts found in long runs at pvs [7]
+arm_bf16 pv8: 8/8 prompts found in long runs at pvs [8]
+arm_bf16 pv9: 8/8 prompts found in long runs at pvs [9]
+arm_nvfp4_deq pv0: 8/8 prompts found in long runs at pvs [0]
+arm_nvfp4_deq pv1: 8/8 prompts found in long runs at pvs [1]
+arm_nvfp4_deq pv2: 8/8 prompts found in long runs at pvs [2]
+arm_nvfp4_deq pv3: 8/8 prompts found in long runs at pvs [3]
+arm_nvfp4_deq pv4: 8/8 prompts found in long runs at pvs [4]
+arm_nvfp4_deq pv5: 8/8 prompts found in long runs at pvs [5]
+arm_nvfp4_deq pv6: 8/8 prompts found in long runs at pvs [6]
+arm_nvfp4_deq pv7: 8/8 prompts found in long runs at pvs [7]
+arm_nvfp4_deq pv8: 8/8 prompts found in long runs at pvs [8]
+arm_nvfp4_deq pv9: 8/8 prompts found in long runs at pvs [9]

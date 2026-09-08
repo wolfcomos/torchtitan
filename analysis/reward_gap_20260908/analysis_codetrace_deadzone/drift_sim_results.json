@@ -1,0 +1,106 @@
+{
+ "n": 12582912,
+ "median_absw": 0.01519775390625,
+ "frac_pick4": 0.4493115743001302,
+ "frac_code_zero": 0.08224280675252278,
+ "frac_code_abs": {
+  "0": 0.08224280675252278,
+  "1": 0.16215157508850098,
+  "2": 0.15027189254760742,
+  "3": 0.1349930763244629,
+  "4": 0.1514883836110433,
+  "5": 0.1470311482747396,
+  "6": 0.11718153953552246,
+  "7": 0.054639577865600586
+ },
+ "frac_tiny": 0.008645772933959961,
+ "tiny_frac_fp4_nonzero": 0.0,
+ "e2m1_rel_spacing_pct": {
+  "0.5->1": 100.0,
+  "1->1.5": 50.0,
+  "1.5->2": 33.3,
+  "2->3": 50.0,
+  "3->4": 33.3,
+  "4->6": 50.0
+ },
+ "e4m3_rel_spacing_pct": 12.5,
+ "bf16_rel_spacing_pct": "0.39-0.78",
+ "block_amax_q50": 0.04638671875,
+ "expert_amax": [
+  0.1787109375,
+  0.322265625,
+  0.197265625,
+  0.17578125,
+  0.16796875,
+  0.1318359375,
+  0.1279296875,
+  0.208984375
+ ],
+ "fp4_rel_rmse": 0.08692284673452377,
+ "rel": {
+  "0.001": {
+   "fp4_codes_changed": 0.00024708112080891925,
+   "fp4_deq_bf16_changed": 0.15892664591471353,
+   "fp4_scales_changed": 8.138020833333333e-05,
+   "bf16_changed": 0.0,
+   "randsign_fp4_codes_changed": 0.01315148671468099,
+   "randsign_bf16_changed": 0.0
+  },
+  "0.01": {
+   "fp4_codes_changed": 0.00023063023885091147,
+   "fp4_deq_bf16_changed": 0.9177571932474772,
+   "fp4_scales_changed": 7.756551106770833e-05,
+   "bf16_changed": 1.0,
+   "randsign_fp4_codes_changed": 0.11130491892496745,
+   "randsign_bf16_changed": 1.0
+  },
+  "0.03": {
+   "fp4_codes_changed": 0.00020082791646321615,
+   "fp4_deq_bf16_changed": 0.9177593390146891,
+   "fp4_scales_changed": 8.519490559895833e-05,
+   "bf16_changed": 1.0,
+   "randsign_fp4_codes_changed": 0.2244257926940918,
+   "randsign_bf16_changed": 1.0
+  },
+  "0.1": {
+   "fp4_codes_changed": 0.00025002161661783856,
+   "fp4_deq_bf16_changed": 0.9177676836649576,
+   "fp4_scales_changed": 8.900960286458333e-05,
+   "bf16_changed": 1.0,
+   "randsign_fp4_codes_changed": 0.4131127993265788,
+   "randsign_bf16_changed": 1.0
+  }
+ },
+ "abs": {
+  "1e-06": {
+   "fp4_codes_changed_fp32master": 0.0005842844645182291,
+   "bf16_changed": 0.017357826232910156,
+   "fp4_codes_changed_after_bf16master": 0.0,
+   "fp4_deq_changed_after_bf16master": 1.8596649169921875e-05
+  },
+  "1e-05": {
+   "fp4_codes_changed_fp32master": 0.003296375274658203,
+   "bf16_changed": 0.13812732696533203,
+   "fp4_codes_changed_after_bf16master": 0.0009795824686686199,
+   "fp4_deq_changed_after_bf16master": 0.0011769930521647136
+  },
+  "0.0001": {
+   "fp4_codes_changed_fp32master": 0.043206214904785156,
+   "bf16_changed": 0.8320767879486084,
+   "fp4_codes_changed_after_bf16master": 0.032967170079549156,
+   "fp4_deq_changed_after_bf16master": 0.036629676818847656
+  },
+  "0.0003": {
+   "fp4_codes_changed_fp32master": 0.11911924680074056,
+   "bf16_changed": 0.9999909400939941,
+   "fp4_codes_changed_after_bf16master": 0.10898319880167644,
+   "fp4_deq_changed_after_bf16master": 0.15219847361246744
+  },
+  "0.001": {
+   "fp4_codes_changed_fp32master": 0.3103783925374349,
+   "bf16_changed": 1.0,
+   "fp4_codes_changed_after_bf16master": 0.3072810967763265,
+   "fp4_deq_changed_after_bf16master": 0.9077789783477783
+  }
+ }
+}

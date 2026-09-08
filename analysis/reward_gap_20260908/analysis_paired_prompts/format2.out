@@ -1,0 +1,32 @@
+=== (A) boxed rate among k=0 groups' recorded samples (reward-independent selection) ===
+   1-5   BF16 n=  58 boxed=3.4% trunc=39.7% | NVFP4 n=  68 boxed=8.8% trunc=42.6%
+   1-10  BF16 n= 112 boxed=7.1% trunc=41.1% | NVFP4 n= 120 boxed=6.7% trunc=44.2%
+  11-30  BF16 n= 186 boxed=7.5% trunc=38.7% | NVFP4 n= 230 boxed=5.7% trunc=36.1%
+   1-50  BF16 n= 508 boxed=9.3% trunc=42.1% | NVFP4 n= 578 boxed=6.7% trunc=40.8%
+  51-100 BF16 n= 496 boxed=10.3% trunc=41.7% | NVFP4 n= 566 boxed=7.1% trunc=38.0%
+ 101-150 BF16 n= 402 boxed=14.9% trunc=43.8% | NVFP4 n= 558 boxed=7.5% trunc=38.9%
+ 151-200 BF16 n= 412 boxed=15.8% trunc=44.7% | NVFP4 n= 568 boxed=7.2% trunc=37.9%
+ 201-250 BF16 n= 384 boxed=22.7% trunc=48.7% | NVFP4 n= 582 boxed=8.2% trunc=40.5%
+ 251-300 BF16 n= 334 boxed=23.1% trunc=53.6% | NVFP4 n= 526 boxed=10.8% trunc=39.0%
+   1-300 BF16 n=2536 boxed=15.3% trunc=45.2% | NVFP4 n=3378 boxed=7.9% trunc=39.2%
+
+=== (B) decomposition on known-truth prompts, completed samples with an Answer line ===
+    block   run     n right-value boxed/latex right&boxed right&unboxed wrong&boxed  reward1-rate-among-these
+   1-50    BF16   287       70.0%       57.1%       50.2%         19.9%        7.0%  0.505
+   1-50   NVFP4   270       46.7%       42.2%       29.3%         17.4%       13.0%  0.404
+  51-100   BF16   292       72.3%       58.6%       50.0%         22.3%        8.6%  0.521
+  51-100  NVFP4   297       47.1%       46.1%       27.9%         19.2%       18.2%  0.384
+ 101-150   BF16   361       70.9%       61.5%       54.0%         16.9%        7.5%  0.551
+ 101-150  NVFP4   349       42.7%       41.0%       24.1%         18.6%       16.9%  0.330
+ 151-200   BF16   327       71.6%       67.9%       58.1%         13.5%        9.8%  0.590
+ 151-200  NVFP4   317       44.8%       39.7%       25.9%         18.9%       13.9%  0.350
+ 201-250   BF16   348       73.6%       71.3%       58.9%         14.7%       12.4%  0.609
+ 201-250  NVFP4   342       39.5%       37.1%       21.1%         18.4%       16.1%  0.316
+ 251-300   BF16   375       74.9%       74.9%       61.3%         13.6%       13.6%  0.621
+ 251-300  NVFP4   369       43.4%       38.8%       25.5%         17.9%       13.3%  0.339
+   1-300   BF16  1990       72.3%       65.7%       55.8%         16.5%        9.9%  0.570
+   1-300  NVFP4  1944       43.8%       40.6%       25.4%         18.4%       15.2%  0.351
+
+=== (C) same decomposition restricted to k=0 groups (both recorded samples reward 0) on known-truth prompts ===
+ BF16: n=112 right-value(unrewarded)=33 (29.5%) boxed/latex=30 (26.8%)
+ NVFP4: n=737 right-value(unrewarded)=181 (24.6%) boxed/latex=63 (8.5%)

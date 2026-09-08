@@ -1,0 +1,66 @@
+===== arm_bf16_4x4_long n= 5260
+status: Counter({'completed': 3656, 'truncated_length': 1604})
+is_validation: Counter({False: 5260})
+nturns: Counter({1: 5260})
+n prompt msgs: Counter({1: 5260})
+roles: Counter({('user',): 5260})
+reward vals: Counter({0.0: 3938, 1.0: 1322})
+reward_breakdown keys: Counter({('RewardMathVerify',): 5260})
+min!=max policy version: 0
+policy versions: min 0 max 312 distinct 313
+records per pv hist: [(4, 1), (16, 293), (18, 2), (20, 1), (32, 16)]
+missing pvs: [] count 0
+first 12 pvs:
+  pv=0 n=16 groups={0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2} nprompts=8 rollout_ids=[(0, 7), (2, 1), (6, 1), (7, 7)]
+  pv=1 n=16 groups={8: 2, 9: 2, 10: 2, 11: 2, 12: 2, 13: 2, 14: 2, 15: 2} nprompts=8 rollout_ids=[(0, 8), (3, 1), (6, 1), (7, 6)]
+  pv=2 n=16 groups={16: 2, 17: 2, 18: 2, 19: 2, 20: 2, 21: 2, 22: 2, 23: 2} nprompts=8 rollout_ids=[(0, 8), (5, 1), (7, 7)]
+  pv=3 n=16 groups={24: 2, 25: 2, 26: 2, 27: 2, 28: 2, 29: 2, 30: 2, 31: 2} nprompts=8 rollout_ids=[(0, 8), (5, 1), (7, 7)]
+  pv=4 n=16 groups={32: 2, 33: 2, 34: 2, 35: 2, 36: 2, 37: 2, 38: 2, 39: 2} nprompts=8 rollout_ids=[(0, 8), (1, 1), (4, 1), (7, 6)]
+  pv=5 n=16 groups={40: 2, 41: 2, 42: 2, 43: 2, 44: 2, 45: 2, 46: 2, 47: 2} nprompts=8 rollout_ids=[(0, 6), (1, 3), (2, 1), (3, 1), (5, 1), (7, 4)]
+  pv=6 n=16 groups={48: 2, 49: 2, 50: 2, 51: 2, 52: 2, 53: 2, 54: 2, 55: 2} nprompts=8 rollout_ids=[(0, 8), (7, 8)]
+  pv=7 n=16 groups={56: 2, 57: 2, 58: 2, 59: 2, 60: 2, 61: 2, 62: 2, 63: 2} nprompts=8 rollout_ids=[(0, 7), (1, 2), (2, 1), (4, 1), (7, 5)]
+  pv=8 n=16 groups={64: 2, 65: 2, 66: 2, 67: 2, 68: 2, 69: 2, 70: 2, 71: 2} nprompts=8 rollout_ids=[(0, 8), (2, 1), (6, 1), (7, 6)]
+  pv=9 n=16 groups={72: 2, 73: 2, 74: 2, 75: 2, 76: 2, 77: 2, 78: 2, 79: 2} nprompts=8 rollout_ids=[(0, 7), (1, 1), (3, 1), (6, 1), (7, 6)]
+  pv=10 n=16 groups={80: 2, 81: 2, 82: 2, 83: 2, 84: 2, 85: 2, 86: 2, 87: 2} nprompts=8 rollout_ids=[(0, 8), (1, 2), (7, 6)]
+  pv=11 n=16 groups={88: 2, 89: 2, 90: 2, 91: 2, 92: 2, 93: 2, 94: 2, 95: 2} nprompts=8 rollout_ids=[(0, 6), (1, 2), (2, 1), (7, 7)]
+group_id range: 0 559
+rollout_id range: 0 7
+duplicate (pv,gid,rid) keys: 0 []
+exact dup records: 0
+distinct groups per pv hist: [(2, 1), (8, 293), (9, 2), (10, 1), (16, 16)]
+records per (pv,group) hist: [(2, 2630)]
+distinct prompts: 2498  prompts seen at >1 pv: 0
+advantage nonzero frac: 0.45475285171102664
+===== arm_nvfp4_deq_4x4_long n= 5784
+status: Counter({'completed': 3978, 'truncated_length': 1806})
+is_validation: Counter({False: 5784})
+nturns: Counter({1: 5784})
+n prompt msgs: Counter({1: 5784})
+roles: Counter({('user',): 5784})
+reward vals: Counter({0.0: 4916, 1.0: 868})
+reward_breakdown keys: Counter({('RewardMathVerify',): 5784})
+min!=max policy version: 0
+policy versions: min 0 max 313 distinct 314
+records per pv hist: [(8, 1), (16, 264), (20, 2), (22, 2), (24, 1), (32, 41), (36, 1), (48, 2)]
+missing pvs: [] count 0
+first 12 pvs:
+  pv=0 n=16 groups={0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2} nprompts=8 rollout_ids=[(0, 8), (7, 8)]
+  pv=1 n=16 groups={8: 2, 9: 2, 10: 2, 11: 2, 12: 2, 13: 2, 14: 2, 15: 2} nprompts=8 rollout_ids=[(0, 8), (6, 1), (7, 7)]
+  pv=2 n=16 groups={16: 2, 17: 2, 18: 2, 19: 2, 20: 2, 21: 2, 22: 2, 23: 2} nprompts=8 rollout_ids=[(0, 8), (7, 8)]
+  pv=3 n=16 groups={24: 2, 25: 2, 26: 2, 27: 2, 28: 2, 29: 2, 30: 2, 31: 2} nprompts=8 rollout_ids=[(0, 7), (1, 2), (2, 1), (6, 1), (7, 5)]
+  pv=4 n=16 groups={32: 2, 33: 2, 34: 2, 35: 2, 36: 2, 37: 2, 38: 2, 39: 2} nprompts=8 rollout_ids=[(0, 8), (3, 1), (7, 7)]
+  pv=5 n=16 groups={40: 2, 41: 2, 42: 2, 43: 2, 44: 2, 45: 2, 46: 2, 47: 2} nprompts=8 rollout_ids=[(0, 6), (1, 1), (3, 1), (4, 2), (5, 1), (7, 5)]
+  pv=6 n=16 groups={48: 2, 49: 2, 50: 2, 51: 2, 52: 2, 53: 2, 54: 2, 55: 2} nprompts=8 rollout_ids=[(0, 8), (3, 1), (6, 1), (7, 6)]
+  pv=7 n=16 groups={56: 2, 57: 2, 58: 2, 59: 2, 60: 2, 61: 2, 62: 2, 63: 2} nprompts=8 rollout_ids=[(0, 7), (1, 1), (3, 1), (6, 1), (7, 6)]
+  pv=8 n=16 groups={64: 2, 65: 2, 66: 2, 67: 2, 68: 2, 69: 2, 70: 2, 71: 2} nprompts=8 rollout_ids=[(0, 8), (2, 1), (6, 1), (7, 6)]
+  pv=9 n=16 groups={72: 2, 73: 2, 74: 2, 75: 2, 76: 2, 77: 2, 78: 2, 79: 2} nprompts=8 rollout_ids=[(0, 7), (1, 1), (5, 1), (6, 1), (7, 6)]
+  pv=10 n=16 groups={80: 2, 81: 2, 82: 2, 83: 2, 84: 2, 85: 2, 86: 2, 87: 2} nprompts=8 rollout_ids=[(0, 8), (7, 8)]
+  pv=11 n=16 groups={88: 2, 89: 2, 90: 2, 91: 2, 92: 2, 93: 2, 94: 2, 95: 2} nprompts=8 rollout_ids=[(0, 6), (1, 1), (2, 1), (4, 1), (7, 7)]
+group_id range: 0 351
+rollout_id range: 0 7
+duplicate (pv,gid,rid) keys: 400 [((69, 1, 0), 2), ((69, 1, 7), 2), ((69, 0, 0), 2), ((69, 0, 7), 2), ((69, 2, 0), 2), ((69, 2, 7), 2), ((69, 4, 0), 2), ((69, 4, 7), 2), ((69, 7, 0), 2), ((69, 7, 7), 2)]
+exact dup records: 124
+distinct groups per pv hist: [(4, 1), (8, 292), (10, 3), (11, 2), (12, 1), (16, 15)]
+records per (pv,group) hist: [(2, 2396), (4, 248)]
+distinct prompts: 2508  prompts seen at >1 pv: 0
+advantage nonzero frac: 0.2939142461964039

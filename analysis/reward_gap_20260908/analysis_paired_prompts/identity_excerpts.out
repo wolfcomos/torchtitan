@@ -1,0 +1,47 @@
+=== response identity across runs at early pvs, keyed (prompt, rollout_id) ===
+ pv=0: common keys=14 byte-identical=0 median common-prefix chars=76.0 max=634
+ pv=1: common keys=15 byte-identical=0 median common-prefix chars=150.0 max=575
+ pv=2: common keys=15 byte-identical=0 median common-prefix chars=117.0 max=404
+ pv=3: common keys=12 byte-identical=0 median common-prefix chars=193.0 max=774
+
+=== in-group wrong-answer agreement for k=0 groups (both recorded samples reward 0, both have an Answer: line) ===
+ BF16: groups with two wrong answered samples=584, same final answer=366 (62.7%)
+ NVFP4: groups with two wrong answered samples=802, same final answer=527 (65.7%)
+
+=== excerpts: NVFP4 reward-0 samples on prompts BF16 solved ===
+--- mode=wrong_well_formed n=749
+ step 84 bf16_k=1 status=completed dup12=0.004 cr=0.344
+   PROMPT: How many ways are there to choose three digits $A, B, C$ with $1 \leq A \leq 9$ and $0 \leq B, C \leq 9$ such that $\overline{ABC}_b$ is even for all choices of base $b$ with $b \geq 10$?  Remember to
+   NVFP4 tail: ' both odd: $ 5 \\times 5 = 25 $\n\nSo total number of $ (A, B) $ pairs with $ A + B $ even: $ 20 + 25 = 45 $\n\n#### Step 4.3: For each such pair, we can choose any even $ C $: 5 choices\n\nSo total number of valid triples:\n\n$$\n45 \\times 5 = 225\n$$\n\n---\n\n### ✅ Final Answer:\n\nAnswer: 225'
+   BF16 correct tail: 'y of the 5 valid $ C $:\n\n$$\n\\text{Total} = 45 \\cdot 5 = 225\n$$\n\n---\n\n### ✅ Final Answer:\n\n$$\n\\boxed{225}\n$$\n\nAnswer: 225'
+ step 249 bf16_k=1 status=completed dup12=0.006 cr=0.371
+   PROMPT: There are $7$ balls in a jar, numbered from $1$ to $7$, inclusive. First, Richard takes $a$ balls from the jar at once, where $a$ is an integer between $1$ and $6$, inclusive. Next, Janelle takes $b$ 
+   NVFP4 tail: '$7 - a = 1$\n- $b = 1$:\n\n$$\n\\binom{7}{6} \\cdot \\binom{1}{1} = 7 \\cdot 1 = 7\n$$\n\n---\n\n### Step 5: Add all the terms\n\n$$\n441 + 651 + 525 + 245 + 63 + 7 = 1932\n$$\n\n---\n\n### Step 6: Find the remainder when divided by 1000\n\n$$\n1932 \\mod 1000 = 932\n$$\n\n---\n\n### Final Answer:\nAnswer: 932'
+   BF16 correct tail: '## Step 6: Find remainder when divided by 1000\n\n$$\n1932 \\mod 1000 = \\boxed{932}\n$$\n\n---\n\n### ✅ Final Answer:\nAnswer: 932'
+--- mode=truncated@limit n=253
+ step 252 bf16_k=1 status=truncated_length dup12=0.002 cr=0.334
+   PROMPT: In the following diagram, a semicircle is folded along a chord $AN$ and intersects its diameter $MN$ at $B$. Given that $MB : BN = 2 : 3$ and $MN = 10$. If $AN = x$, find $x^2$.  Remember to put your 
+   NVFP4 tail: 'rac{b}{2}\n$$\n\nFrom the second equation:\n\n$$\nb(1 - t) = \\frac{b}{2} \\Rightarrow 1 - t = \\frac{1}{2} \\Rightarrow t = \\frac{1}{2}\n$$\n\nNow plug into first equation:\n\n$$\na + \\frac{1}{2}(10 - a) = \\frac{a + 4}{2}\n$$\n\nMultiply both sides by 2:\n\n$$\n2a + (10 - a) = a + 4\n\\Rightarrow a + 1'
+   BF16 correct tail: ')^2} = \\sqrt{64 + 16} = \\sqrt{80}\n$$\n\nSo:\n\n$$\nx^2 = AN^2 = 80\n$$\n\n---\n\n### ✅ Final Answer:\n\n$$\n\\boxed{80}\n$$\n\nAnswer: 80'
+ step 246 bf16_k=1 status=truncated_length dup12=0.267 cr=0.24
+   PROMPT: Replace the letters $a$, $b$, $c$ and $d$ in the following expression with the numbers $1$, $2$, $3$ and $4$, without repetition: $a+\cfrac{1}{b+\cfrac{1}{c+\cfrac{1}{d}}}$ Find the difference between
+   NVFP4 tail: '- The inner fraction $\\frac{1}{b + \\frac{1}{c + \\frac{1}{d}}}$ as small as possible\n\nSo:\n- Make $a = 1$\n- Make the denominator $b + \\frac{1}{c + \\frac{1}{d}}$ as large as possible\n\nTry $b = 4$, $c = 3$, $d = 2$:\n\n$$\nc + \\frac{1}{d} = 3 + \\frac{1}{2} = \\frac{7}{2}\n$$\n$$\nb + \\frac{'
+   BF16 correct tail: 'rac{52}{15}\n$$\n\nThus, $m = 52$, $n = 15$, and:\n\n$$\nm + n = 52 + 15 = \\boxed{67}\n$$\n\n---\n\n### ✅ Final Answer:\n\nAnswer: 67'
+--- mode=completed_no_final_answer n=25
+ step 283 bf16_k=1 status=completed dup12=0.0 cr=0.39
+   PROMPT: Vessel $A$ contains liquids $X$ and $Y$ in the ratio $X:Y = 8:7$. Vessel $B$ holds a mixture of $X$ and $Y$ in the ratio $X:Y = 5:9$. In what ratio should you mix the liquids from both vessels to achi
+   NVFP4 tail: 'rac{2}{7}b\n$$\n\n---\n\n### Step 3: Solve for the ratio $ a:b $\n\n$$\n\\frac{a}{b} = \\frac{\\frac{2}{7}}{\\frac{1}{15}} = \\frac{2}{7} \\cdot \\frac{15}{1} = \\frac{30}{7}\n$$\n\nSo the ratio $ a:b = 30:7 $\n\n---\n\n### Step 4: Compute $ a + b $\n\n$$\na + b = 30 + 7 = 37\n$$\n\n---\n\n### Final Answer: 37'
+   BF16 correct tail: '}\n$$\n\n---\n\n### Step 4: Final Answer\n\nSo the ratio of A:B is **30:7**\n\nThen, $ a + b = 30 + 7 = 37 $\n\n---\n\n**Answer: 37**'
+ step 62 bf16_k=1 status=completed dup12=0.262 cr=0.293
+   PROMPT: Let \(W, X, Y,\) and \(Z\) be four different digits selected from the set    \(\{ 1,2,3,4,5,6,7,8,9\}.\)    Find the smallest possible value of the sum \(\frac{W}{X} + \frac{Y}{Z}\). The original answ
+   NVFP4 tail: '- $ W = 1 $, $ X = 8 $\n- $ Y = 2 $, $ Z = 9 $\n\nAll digits are distinct: 1, 8, 2, 9 — ✅\n\n---\n\n### Step 3: Final Answer\n\nWe are to express the answer as $ \\frac{m}{n} $, and compute $ m + n $.\n\nHere, $ m = 25 $, $ n = 72 $, so:\n\n$$\nm + n = 25 + 72 = 97\n$$\n\n---\n\n### Final Answer: 97'
+   BF16 correct tail: 'ac{Y}{Z} $ is:\n\n$$\n\\frac{25}{72}\n$$\n\nSo, $ m = 25 $, $ n = 72 $\n\n$$\nm + n = 25 + 72 = \\boxed{97}\n$$\n\n---\n\n**Answer: 97**'
+--- mode=truncated@limit+repetitive n=5
+ step 192 bf16_k=1 status=truncated_length dup12=0.375 cr=0.199
+   PROMPT: The positive integer $n$ has the following property: if the last three digits of $n$ are removed, the number becomes $\sqrt[3]{n}$. Find $n$.  Remember to put your answer on its own line after "Answer
+   NVFP4 tail: '0 $:\n\n$$\nk^3 = 1000000, \\quad \\left\\lfloor \\frac{1000000}{1000} \\right\\rfloor = 1000 \\neq 100\n$$\n\nTry $ k = 1000 $:\n\n$$\nk^3 = 1000000000, \\quad \\left\\lfloor \\frac{1000000000}{1000} \\right\\rfloor = 1000000 \\neq 1000\n$$\n\nTry $ k = 100 $:\n\n$$\nk^3 = 1000000, \\quad \\left\\lfloor \\frac{'
+   BF16 correct tail: 'ght\\rfloor = 32 $ ✅\n\nThat’s exactly the condition we want!\n\n---\n\n### ✅ Final Answer:\n\n$$\n\\boxed{32768}\n$$\n\nAnswer: 32768'
+ step 35 bf16_k=2 status=truncated_length dup12=0.408 cr=0.269
+   PROMPT: The graph of \( (x^2 + y^2 - 1)^3 = x^2 y^3 \) is a heart-shaped curve.   For how many ordered pairs of integers \((x, y)\) is the point \((x, y)\) inside or on this curve?  Remember to put your answe
+   NVFP4 tail: ' 1 - 1)^3 = 4^3 = 64$, $RHS = 4 \\cdot 1 = 4$ → $64 \\not\\leq 4$ ❌  \n- $y = 2$: $LHS = (4 + 4 - 1)^3 = 7^3 = 343$, $RHS = 4 \\cdot 8 = 32$ → $343 \\not\\leq 32$ ❌\n\n→ No valid points for $x = 2$\n\n---\n\n### Step 4: List of Valid Points\n\nFrom above, the valid integer points $(x, y)$ where'
+   BF16 correct tail: '1, 0)$\n- $(1, 1)$\n- $(-1, 0)$\n- $(-1, 1)$\n\nThese are **7 points**.\n\n---\n\n### ✅ Final Answer:\n\n$$\n\\boxed{7}\n$$\n\nAnswer: 7'

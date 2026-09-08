@@ -1,0 +1,650 @@
+[
+ {
+  "angle": "Earlier same-node 6-arm ablation (2026-08-25, outputs/arm_bf16 and outputs/arm_nvfp4_deq) as a control for the 4+4 long runs: step count, lr schedule, prompt pairing, step-for-step reward comparison over steps 1-10, what its write-up concluded, and what differs between ablation and long runs (schedule, topology, code commits).",
+  "summary": "The control does NOT show that something changed: the BF16-over-NVFP4 reward gap in the long runs is already present, in the same direction and about the same size, in the 10-step same-node ablation on the identical prompts, and it is present at step 1 before any optimizer update. Facts: (1) The ablation ran exactly 10 steps per arm (ablation_arms.py:100 num_training_steps=10, :116 lr_scheduler.total_steps=10) with warmup 2 + linear decay: trainer/lr = 5e-7, 1e-6, 1e-6, 8.75e-7 ... 1.25e-7 at step 10 (mean 6.0e-7 over steps 1-10); the long runs use 5e-7, 1e-6, then constant 1e-6 (mean 9.5e-7). (2) All four runs consumed the same 8 prompts at every policy version 0-9 (8/8 prompt-text md5 overlap; rollout/prompt_length/mean identical at steps 1-10 in all 11 output dirs), while the sampled responses differ (0/16 and 1/16 shared response hashes at pv0), so ablation and long runs are independent replicates on identical prompts. (3) Steps 1-10 rollout reward: ablation BF16 0.0984 vs NVFP4 0.0641 (paired sign 8+/1=/1-, mean gap +0.034); long BF16 0.0813 vs NVFP4 0.0672 (7+/1=/2-, +0.014). The NVFP4 arm reproduces itself across code versions almost step-for-step (4/10 steps identical values, mean diff -0.003), as do its mismatch metrics: logprob diff mean -0.00280 (ablation) vs -0.00272 (long), clip fraction 0.0199 vs 0.0204, zero-std fraction 0.74 vs 0.75 (BF16: 0.66 / 0.70). (4) At step 1 (policy version 0 = untouched HF weights, so only rollout-side expert precision differs) BF16 scored 6/64 and 5/64 while four independent NVFP4-deq replicates (arm_nvfp4_deq, arm_nvfp4_deq_4x4, arm_nvfp4_deq_4x4_100, arm_nvfp4_deq_4x4_long) scored 2/64, 4/64, 3/64, 2/64: pooled 0.086 vs 0.043, one-sided Fisher p=0.073. Over steps 1-10 all four NVFP4-deq replicates (0.0641/0.0703/0.0578/0.0672) lie below both BF16 replicates (0.0984/0.0813), ratio 0.72, P=0.067 under exchangeability; the other low-precision arms sit in between (mxfp8_hp 0.083, mxfp8_deq 0.075, mxfp8_e2e 0.073, nvfp4_hp 0.073). (5) In the long runs the gap is present from the first block (1-10: 0.081/0.067; 11-20: 0.102/0.052; 21-30: 0.156/0.105; 1-30: 0.113/0.075), so the PR draft's \"within noise for the first ~30 steps\" is not supported by block means. (6) The ablation write-up (repos/titan-nvfp4 nvfp4_4over6_results/README.md, commit 1f47dc8c5 2026-08-25) reports reward mean 0.098 (bf16) vs 0.064 (nvfp4_deq, lowest of six arms) but concludes \"Loss/reward/grad-norm/entropy show no precision ordering\" and \"Ten steps at lr 1e-6 is a short horizon \u2014 this is a stability/parity smoke, not a convergence claim\"; it also documents the step-3 all-zero-reward no-op in arm_nvfp4_deq, which the long NVFP4 run reproduces exactly (step 3 reward 0, grad norm 0) while both BF16 runs got 1/64. (7) Differences ablation vs long: lr decay-to-0-at-10 vs constant 1e-6; 10 vs 300+ steps; same-node 2+2 (trainer dp_shard1/tp2/ep2, generator tp2/ep2, gb-nvl-118) vs cross-node 4+4 (trainer dp_shard2/tp2/ep4, generator dp2/tp2/ep4, torchstore NCCL/MNNVL sync, 8 h windows with 1-2 replayed steps per handoff); AIME validation at steps 0/10 vs none; model-only vs full checkpoints; code titan 28426e01d(+uncommitted run-local patches)/ao 3c9fbc59a on 08-25 vs titan a24a9e08e/ao 2f6cf4fce on 09-05 (recipe-selector consolidation, torchao grouped-GEMM dispatcher wiring, skip knob; nvfp4.py 224 lines and four_over_six_grouped.py 36 lines changed), same container image, fa/DSL overlays and FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT=1 in both launchers; the long runs did not use the experimental inference weight cache branch. Interpretation: the gap is intrinsic to the NVFP4-deq arm at this base model and workload and is not created by the constant-lr schedule, the cross-node topology, the prompt stream, or the Aug-30 code refactor; the ablation simply lacked horizon and replicates and its write-up under-read a -35% reward difference. The step-1 evidence points to an inference-side penalty (the NVFP4-quantized policy solves fewer DAPO-math prompts before any training), which then leaves GRPO with fewer non-degenerate groups; whether NVFP4 additionally learns less per unit of signal, and whether a different lr would let it climb later, cannot be decided from this angle.",
+  "evidence": [
+   {
+    "observation": "Ablation arms train for exactly 10 steps with lr_scheduler.total_steps=10 and zero-std groups kept; every arm shares the workload; NVFP4 arms differ only in the converter.",
+    "numbers": "num_training_steps = 10 (line 100), num_prompts_per_train_step = 8 (101), num_samples_per_prompt = 8 (102), drop_zero_std_reward_groups = False (108), lr_scheduler.total_steps = 10 (116), AdamW lr 1e-6 (61)",
+    "source": "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/perf_worktrees/titan/ablation_arms.py (identical to /home/scratch.hanlinb_ent_1/repos/titan-nvfp4/ablation_arms.py and prcut_worktrees/refactor-v2/ablation_arms.py)",
+    "bearing": "Establishes the control's horizon: 10 steps, so the control cannot speak to steps >10; supports comparing steps 1-10 only."
+   },
+   {
+    "observation": "trainer/lr tag: ablation = warmup 2 then linear decay to 0 at step 10; long runs = warmup 2 then constant 1e-6.",
+    "numbers": "ablation steps 1-10: 5e-7, 1e-6, 1e-6, 8.75e-7, 7.5e-7, 6.25e-7, 5e-7, 3.75e-7, 2.5e-7, 1.25e-7 (mean 6.0e-7); long: 5e-7, 1e-6, then 1e-6 x8 (mean 9.5e-7). Launch args for both long runs: --trainer.lr-scheduler.total-steps 100000 --trainer.lr-scheduler.decay-ratio 0.0 --rollouter.train-dataset.skip 0",
+    "source": "tfevents in outputs/{arm_bf16,arm_nvfp4_deq,arm_bf16_4x4_long,arm_nvfp4_deq_4x4_long} via scratch analysis_ablation_control/step_tables.txt; ablation/logs/arm_bf16_4x4_long.window_2054558.log:1 and ablation/logs/arm_nvfp4_deq_4x4_long.window1.log:1; ablation/window_chain_main.sh:186",
+    "bearing": "The gap appears under BOTH schedules at steps 1-10, so the constant-lr schedule is not what creates it (refutes 'schedule change caused the gap'); cannot test lr effects beyond step 10."
+   },
+   {
+    "observation": "All four runs saw identical prompts at each policy version 0-9; all 11 arm output dirs have identical rollout/prompt_length/mean at steps 1-10. Responses are not identical across runs of the same arm.",
+    "numbers": "prompt-set overlap 8/8 at every pv 0-9 for ABLbf16\u2229ABLnvfp4, LONGbf16\u2229LONGnvfp4, ABLbf16\u2229LONGbf16, ABLnvfp4\u2229LONGnvfp4; prompt_length identical 10/10 steps in arm_bf16, arm_bf16_4x4_long, arm_nvfp4_deq, arm_nvfp4_deq_4x4, arm_nvfp4_deq_4x4_100, arm_nvfp4_deq_4x4_long, arm_nvfp4_hp, arm_mxfp8_{deq,e2e,hp}; shared (prompt,response) pairs at pv0: bf16 vs bf16_long 0/16, nvfp4 vs nvfp4_long 1/16",
+    "source": "rollout_samples.jsonl of each run; scratch analysis_ablation_control/prompts.txt, pv0_responses.txt, stats.txt; DapoMathDataset seed=42 shuffle=True in /home/scratch.hanlinb_ent_1/repos/titan-nvfp4/torchtitan/experiments/rl/examples/dapo_math/data.py:102-104",
+    "bearing": "Refutes 'different prompts explain the gap'; makes ablation and long runs prompt-paired independent replicates, so per-step comparisons are valid."
+   },
+   {
+    "observation": "Steps 1-10 rollout reward gap is present in the ablation and in the long runs, same direction.",
+    "numbers": "ablation BF16 0.0984 vs NVFP4 0.0641 (per-step diffs +0.0625,+0.0156,+0.0156,+0.1094,+0.0469,-0.0312,+0.0469,+0.0625,0,+0.0156; sign 8+/1=/1-; mean +0.0344); long BF16 0.0813 vs NVFP4 0.0672 (7+/1=/2-; mean +0.0141); same-arm across runs: NVFP4 mean diff -0.0031 with 4/10 steps identical, BF16 +0.0172 with 2/10 identical",
+    "source": "scratch analysis_ablation_control/step_tables.txt and stats.txt (from tfevents, later file wins, steps<=300)",
+    "bearing": "Supports 'gap is intrinsic to the arm and already visible at the same steps in the control'; refutes 'gap emerged only in the long runs'."
+   },
+   {
+    "observation": "Step 1 = policy version 0 = untouched HF weights in every run, so the only NVFP4-vs-BF16 difference at step 1 is rollout-side expert precision. NVFP4-deq scored lower in all four independent replicates.",
+    "numbers": "BF16: 6/64 (arm_bf16), 5/64 (arm_bf16_4x4_long); NVFP4-deq: 2/64 (arm_nvfp4_deq), 4/64 (arm_nvfp4_deq_4x4), 3/64 (arm_nvfp4_deq_4x4_100), 2/64 (arm_nvfp4_deq_4x4_long); pooled 11/128=0.086 vs 11/256=0.043, one-sided Fisher p=0.073; other arms at step 1: nvfp4_hp 5/64, mxfp8_deq 1/64, mxfp8_e2e 2/64, mxfp8_hp 5/64, nvfp4_deq_cache_smoke (experimental branch) 6/64",
+    "source": "scratch analysis_ablation_control/stats.txt, all_arms.txt (tfevents rollout_reward/_mean step 1 across all outputs/arm_* dirs)",
+    "bearing": "Supports an inference-side (rollout-precision) reward penalty that exists before any training; p=0.07 so suggestive, not conclusive on its own."
+   },
+   {
+    "observation": "Over steps 1-10 on identical prompts, every NVFP4-deq replicate is below both BF16 replicates; the other low-precision arms are in between.",
+    "numbers": "BF16 0.0984, 0.0813 (mean 0.0898); NVFP4-deq 0.0641, 0.0703, 0.0578, 0.0672 (mean 0.0648, ratio 0.72); all 4 < min BF16, P=0.067 under exchangeability; mxfp8_hp 0.0828, mxfp8_deq 0.0750, mxfp8_e2e 0.0734, nvfp4_hp 0.0734; zero-std fraction steps 1-10: ablation 0.6625 (bf16) vs 0.7375 (nvfp4), long 0.70 vs 0.75",
+    "source": "scratch analysis_ablation_control/stats.txt, step_tables.txt",
+    "bearing": "Supports 'intrinsic to the NVFP4 arm at this base model/workload'; ordering bf16 > mxfp8 > nvfp4 is consistent with a precision effect, though the mxfp8/nvfp4_hp spread is within replicate noise."
+   },
+   {
+    "observation": "Trainer-generator mismatch metrics of the NVFP4 arm are the same in the Aug-25 ablation code and the Sep-05 long-run code.",
+    "numbers": "logprob diff mean -0.00280 (ablation) vs -0.00272 (long, steps 1-10); clip fraction 0.0199 vs 0.0204; BF16: -0.00070 vs -0.00073, 0.0032 vs 0.0034; logprob diff max mean 3.53 vs 2.95",
+    "source": "scratch analysis_ablation_control/step_tables.txt",
+    "bearing": "Refutes 'the Aug-30 refactor (recipe selector / torchao dispatcher wiring) changed NVFP4 numerics'; consistent with earlier bitwise validation of the dispatcher refactor."
+   },
+   {
+    "observation": "Long-run reward gap is present from the first 10-step block, not only after step 30.",
+    "numbers": "block means BF16/NVFP4: 1-10 0.081/0.067; 11-20 0.102/0.052; 21-30 0.156/0.105; 31-40 0.113/0.081; 41-50 0.122/0.077; 1-30 0.113/0.075; 31-60 0.123/0.084; 61-100 0.127/0.074; 1-100 0.122/0.077",
+    "source": "scratch analysis_ablation_control/step_tables.txt; reference compare_step-300.json block means 1-100 0.12171875 vs 0.07734375",
+    "bearing": "Refutes the PR-draft sentence 'within noise for the first ~30 steps and separate from then on'; the ratio is already 1.5 over steps 1-30."
+   },
+   {
+    "observation": "Ablation write-up reports the reward difference but concludes no precision ordering for reward; it frames the run as a stability smoke.",
+    "numbers": "Results table: arm_bf16 reward mean 0.098, reward@10 0.172; arm_nvfp4_deq 0.064 (lowest of six), 0.156; logprob diff -0.00070 vs -0.00280; clip 0.32% vs 1.99%. Quotes: 'AdamW lr 1e-6, warmup 2 + linear decay over 10 steps'; Finding 1 'No divergence in any arm... Ten steps at lr 1e-6 is a short horizon \u2014 this is a stability/parity smoke, not a convergence claim.'; Finding 2 'Quantization is visible exactly where the blog says it should be: in the rollout-vs-trainer logprob difference (BF16 floor ~0.0007 nats, MXFP8 ~0.0010, NVFP4 ~0.0027) and the PPO ratio clipped fraction (~0.3% / ~0.6% / ~2%). ... Loss/reward/grad-norm/entropy show no precision ordering.'; Finding 3 'Step-3 zero-grad no-ops in arm_mxfp8_e2e and arm_nvfp4_deq (grad norm exactly 0) are all-zero-reward rollout batches'",
+    "source": "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/perf_worktrees/titan/nvfp4_4over6_results/README.md (== prcut_worktrees/refactor-v2/nvfp4_4over6_results/README.md; committed as 1f47dc8c5 'Add Qwen3-30B-A3B six-arm recipe-ablation configs and results' 2026-08-25 22:47 -0700 in /home/scratch.hanlinb_ent_1/repos/titan-nvfp4; summary.csv there: arm_bf16 reward_mean 0.0984375, arm_nvfp4_deq 0.0640625)",
+    "bearing": "The control's own numbers contained the same gap (-35%) that the write-up dismissed as noise; the long runs replicate it, so the write-up's 'no precision ordering' for reward is not supported once replicates exist."
+   },
+   {
+    "observation": "The step-3 all-zero-reward no-op reported for arm_nvfp4_deq recurs in the long NVFP4 run on the same prompts; BF16 gets 1/64 at step 3 in both runs.",
+    "numbers": "step 3 reward: ABL_bf16 0.0156, ABL_nvfp4 0, LONG_bf16 0.0156, LONG_nvfp4 0; grad norm 0.0776 / 0 / 0.0562 / 0; zero-std fraction 0.875 / 1.0 / 0.875 / 1.0",
+    "source": "scratch analysis_ablation_control/step_tables.txt",
+    "bearing": "Supports a prompt-level rollout-precision effect reproducible across code versions and topologies."
+   },
+   {
+    "observation": "Code versions differ between ablation and long runs, but image and env knobs are identical; the long runs used the live checkouts, not the experimental weight-cache worktree.",
+    "numbers": "Ablation ran 2026-08-25 17:52 UTC (bf16) and 23:46 UTC (nvfp4) with titan HEAD 28426e01d (reflog: committed 08-25 02:11 -0700, next commit 1f47dc8c5 22:47 -0700) + untracked ablation_arms.py (class NVFP4FourOverSixGroupedExpertsConverter) and ao 3c9fbc59a (08-25 02:11 -0700, unchanged until 08-30). Long runs: TITAN=/scratch/repos/titan-nvfp4 AO=/scratch/repos/ao-nvfp4 = titan a24a9e08e (nvfp4-4over6-refactor, 09-04) and ao 2f6cf4fce (08-30); titan diff 28426e01d..a24a9e08e: quantization/nvfp4.py 224 lines, mx.py 19, rl actors/controller/train.py/attention.py/data.py; ao diff 3c9fbc59a..2f6cf4fce: four_over_six_grouped.py 36 lines, config.py +62, utils.py +31, four_over_six.py 13, four_over_six_cutedsl.py 6. Both launchers: IMAGE vllm:26.08-py3.63853605-devel-arm64, same fa_overlay cute/_fa4.py/nvidia_cutlass_dsl_462 mounts, FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT=1, seeds 42/42",
+    "source": "git log/reflog of /home/scratch.hanlinb_ent_1/repos/titan-nvfp4 and /home/scratch.hanlinb_ent_1/repos/ao-nvfp4; ablation/run_ablation_arm.sh:14,20,53-63,79-80; ablation/run_4x4_fastnic.sh:21-23,32,39,64-66,74,92-93; ablation/logs/arm_bf16_4x4_long.window_2054558.log:1; rl_smoke/FROZEN_SHAS.md ('Run-local titan patch (uncommitted...)')",
+    "bearing": "Lists what changed; combined with identical mismatch metrics and identical NVFP4 per-step rewards it refutes 'a code change created the gap'. Exact dirty-tree state of the ablation is not recoverable."
+   },
+   {
+    "observation": "Topology differs: ablation same-node 2+2, long runs cross-node 4+4 with chained windows.",
+    "numbers": "ablation trainer mesh pp=1, dp_shard=1, tp=2, ep=2; generator tp=2, ep=2 (gb-nvl-118-compute02 / -compute01). Long: trainer dp_shard=2, tp=2, ep=4; generator dp_shard=2, tp=2, ep=4 (vLLM tensor_parallel_size=2, data_parallel_size=2); 9-10 tfevents launches per run through step 300",
+    "source": "ablation/logs/arm_bf16.log ('Building device mesh with parallelism'), ablation/logs/arm_bf16_4x4_long.window_2054558.log, rl_smoke/logs/worker_gb-nvl-059-compute04_window_2054558.log; CHAINED_RUNS.md 'Topology'",
+    "bearing": "The NVFP4 gap is the same under both topologies, so topology is not the cause; topology does explain why responses are not bitwise identical across runs."
+   },
+   {
+    "observation": "A third NVFP4-deq run with a 100-step decaying schedule (cross-node, but prompts replayed on resume) shows the same reward level and never climbed.",
+    "numbers": "arm_nvfp4_deq_4x4_100 steps 1-10 mean 0.0578; 10-step bucket means 0.056-0.119 (1-10: 0.058, 51-60: 0.119, 91-100: 0.073); lr 9.2e-7 (1-10) -> 5.6e-8 (91-100)",
+    "source": "scratch analysis_ablation_control/all_arms.txt; ablation/final_report/pr_milestone_comment.md section 2 and 8",
+    "bearing": "Weakly supports 'not schedule-specific' (decaying lr also flat), but the prompt replay in that run (256 distinct prompts over 100 steps) makes it a confounded replicate."
+   }
+  ],
+  "hypotheses_assessed": [
+   {
+    "hypothesis": "Something changed between the 08-25 ablation and the 09-05 long runs (lr schedule, topology, code refactor, prompt stream) that introduced the NVFP4 reward gap.",
+    "verdict": "REFUTED",
+    "reasoning": "The gap exists at steps 1-10 in the ablation itself (0.098 vs 0.064, sign 8+/1=/1-) on the identical prompts, under a decaying schedule, same-node 2+2, and the pre-refactor code; NVFP4's per-step rewards and its logprob-diff/clip-fraction magnitudes are essentially identical across code versions (-0.00280 vs -0.00272; 0.0199 vs 0.0204)."
+   },
+   {
+    "hypothesis": "The gap is intrinsic to the NVFP4-deq arm at this base model and workload, present before training as a rollout-precision effect.",
+    "verdict": "SUPPORTED",
+    "reasoning": "At step 1 (untouched HF weights) all four NVFP4-deq replicates scored below both BF16 replicates (pooled 0.043 vs 0.086, Fisher p=0.073); over steps 1-10 all four are below both BF16 (ratio 0.72, P=0.067 under exchangeability); zero-std fraction is higher for NVFP4 in every run. Moderate strength: individual p-values are marginal, the consistency of direction across 4 replicates + 4 other low-precision arms carries the weight."
+   },
+   {
+    "hypothesis": "The gap is specific to the constant lr 1e-6 schedule of the long runs.",
+    "verdict": "PARTIALLY_SUPPORTED",
+    "reasoning": "Refuted for its onset: the same gap occurs under the decaying ablation schedule and at step 1 where lr is irrelevant. Undecided for its persistence: no NVFP4 run with a different lr and a clean prompt stream exists beyond 10 steps (arm_nvfp4_deq_4x4_100 decayed to ~0 and stayed flat at 0.056-0.119 but replayed prompts). Whether a lower/higher lr would let NVFP4 climb after step 30 cannot be told from the control."
+   },
+   {
+    "hypothesis": "The ablation showed NVFP4 tracking BF16 reward (i.e., the earlier result contradicts the long runs).",
+    "verdict": "REFUTED",
+    "reasoning": "The ablation's own table has arm_nvfp4_deq lowest of six arms in reward (0.064 vs 0.098, -35%) and highest in clip fraction and logprob diff; its write-up called reward 'no precision ordering' because 10 steps at n=64/step cannot resolve it, not because the data showed parity."
+   },
+   {
+    "hypothesis": "Different prompts (dataset position / replay) explain the BF16-NVFP4 difference.",
+    "verdict": "REFUTED",
+    "reasoning": "8/8 prompt texts identical at every policy version 0-9 across all four runs and prompt_length identical at steps 1-10 in all 11 arm output dirs; both long runs start at stream position 0 with skip 0 and the PR draft reports 0 cross-version repeats."
+   },
+   {
+    "hypothesis": "The long NVFP4 run ran the experimental inference weight-cache branch or otherwise different NVFP4 kernels than the ablation.",
+    "verdict": "REFUTED",
+    "reasoning": "run_4x4_fastnic.sh points at /scratch/repos/titan-nvfp4 and /scratch/repos/ao-nvfp4 (branches nvfp4-4over6-refactor at a24a9e08e / 2f6cf4fce); the weight-cache branch lives only in perf_worktrees/{titan,ao}. Both launchers set the same fused row-scaled env knob and mount the same DSL 4.6.2 / fa overlays; mismatch metrics unchanged."
+   }
+  ],
+  "caveats": "The control is only 10 steps per arm with 64 binary rewards per step (granularity 1/64), so every statistic here is low-powered: the strongest single test is the pooled step-1 Fisher p=0.073 and the 4-of-4 NVFP4 replicates below both BF16 (P=0.067); the conclusion rests on consistency of direction across replicates, arms, schedules, topologies and code versions rather than on any one p-value. Per-step rewards are dominated by prompt difficulty (e.g., step 3 near zero and steps 6/10 high in every run), which is why pairing on prompts matters and why unpaired block means can mislead. The exact dirty working-tree state of the ablation (uncommitted run-local patches per FROZEN_SHAS.md, untracked ablation_arms.py) cannot be reconstructed; I inferred the ablation's commits from reflog timestamps versus the console-log start times (titan 28426e01d, ao 3c9fbc59a). The ablation's responses are not bitwise reproducible against the long runs (different parallelism), so this is a replicate comparison, not a determinism check. My angle cannot separate 'NVFP4 samples worse (inference-side)' from 'NVFP4 learns less per unit of signal (training-side)' beyond step 10, nor say whether a different lr would change the later trajectory; arm_nvfp4_deq_4x4_100 hints the flatness is not schedule-specific but is confounded by prompt replay. The arm_nvfp4_deq_cache_smoke step-1 value (6/64) comes from the experimental weight-cache branch, 3 steps only, and was excluded from the pooled tests.",
+  "artifacts": [
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/extract_tf.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/scalars.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/tags.txt",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/step_tables.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/step_tables.txt",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/prompts.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/prompts.txt",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/pv0_responses.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/pv0_responses.txt",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/all_arms.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/all_arms.txt",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/all_arms_first30.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/stats.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_ablation_control/stats.txt",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/perf_worktrees/titan/nvfp4_4over6_results/README.md",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/perf_worktrees/titan/nvfp4_4over6_results/summary.csv",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/perf_worktrees/titan/ablation_arms.py",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/ablation/run_ablation_arm.sh",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/ablation/run_4x4_fastnic.sh",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/ablation/final_report/pr_milestone_comment.md",
+   "/home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/rl_smoke/FROZEN_SHAS.md"
+  ]
+ },
+ {
+  "angle": "Exhaustive sweep of all 81 tfevents scalar tags for arm_bf16_4x4_long vs arm_nvfp4_deq_4x4_long, steps 1-300 (later launch file wins on replayed steps), with block means, cross-run per-step correlations, handoff-discontinuity checks, and cause/consequence classification of every tag differing >15% in the 201-300 block.",
+  "summary": "SWEEP RESULT. 81 tags, identical tag sets, 300/300 steps per tag in both runs. 30 tags differ by >15% in the 201-300 mean (full CSV: all_tags_block_means.csv; flagged subset with classification: flagged_tags_gt15pct_201-300.csv). They fall into four groups: (1) reward family + its arithmetic derivatives (reward mean/sum/std/RewardMathVerify, zero-std frac 0.70 vs 0.49, advantage std 0.52 vs 0.70, advantage min -0.88 vs -1.72, loss 0.0070 vs 0.0192, grad norm 0.120 vs 0.169) -- all CONSEQUENCES of the per-prompt solve rate; grad_norm correlates -0.84/-0.86 with zero-std frac within each run, and NVFP4 had 18 steps with zero signal groups (grad_norm=0) vs 2 for BF16. (2) Trainer/generator mismatch family: bit_wise/logprob_diff/mean -0.00291 vs -0.00068 (4.3x), logprob_diff/max 3.87 vs 1.12 (3.5x, peaks 36.0 @249 and 15.1 @202 vs 14.7 @195), loss/ratio_clipped_frac 0.0205 vs 0.0032 (6.4x), loss/ratio_mean 0.9991 vs 0.9998. These are the ONLY flagged tags that are (a) present at full magnitude from step 1 and (b) flat over 300 steps (slopes t<=0.7), which makes them the only CANDIDATE CAUSES in the tfevents data; but per-step they are uncorrelated with reward within the NVFP4 run (r=-0.005, +0.04). (3) Perf-only tags (decode 1.63x, ITL 1.64x, prefill 1.52x, fwd_bwd 38 vs 23 s, step total 642 vs 388 s, 94% of which is wait_for_training_batch=rollout, tokens/s 0.60x) -- UNRELATED to reward. (4) 1e-8..1e-6 perf ratios -- noise. NOT differing (<2.5%): entropy (0.282 vs 0.286, cross-run r=0.97), response length (1421 vs 1437, r=0.96), truncation rate (0.336 vs 0.339, r=0.90), output_tokens std, padding frac, num_microbatches, lr (identical 1e-6), policy_version, min/max_policy_version (=step-1, policy_age 0 in both), prompt_length mean/max and num_cached_tokens (r=1.000, byte-identical => same prompts confirmed), truncation. KEY TIMING FACT: the gap is NOT a later divergence of two initially-equal curves. NVFP4 is below BF16 from the first 20 steps (0.059 vs 0.091; paired t over steps 1-20 = +3.70, BF16 higher on 17/20; steps 1-30 t=+4.15, 24/30, 217 vs 143 correct of 1920 samples) while lr is 1e-6 and the policy has barely moved; the difference then GROWS because BF16 improves (slope +0.063/100 steps, t=9.7) and NVFP4 does not (+0.0076/100, t=1.8; zero-std slope -0.011/100, t=-1.0). Conditional on prompt difficulty (BF16 reward bin), NVFP4 achieves 0.60-0.72x of BF16 in steps 1-100 and 0.33-0.43x in 201-300 (OLS nvfp4=0.547*bf16+0.011 early, 0.385*bf16-0.005 late). Cross-run per-step reward r=0.675 (lag +/-1: 0.04/-0.02, lag 5: 0.02; detrended 0.72) confirms shared prompt difficulty drives ~45% of per-step variance. HANDOFFS: no resume artefacts -- replayed steps (14 BF16, 13 NVFP4 pairs at identical weights+prompts) differ by std 0.043 (sampling-noise floor), lr/policy_version/prompt_length identical across the pair, 5-step before/after means at all 11 handoffs move within that floor, first-3-steps-after-resume reward/logprob-diff/clip means match the rest (NVFP4 0.073 vs 0.089 reward, n=21; -0.00289 vs -0.00291 lpd). INTERPRETATION: the tfevents evidence points to a deficit that exists at (near-)identical weights, i.e. the quantized 4over6 forward used by BOTH the vLLM generator and the trainer (shared model_spec, config_registry.py:798-803) lowers the sampled-response accuracy of Qwen3-30B-A3B on DAPO-math before any RL signal, and the resulting 30% fewer signal-carrying groups (2.3-2.4 vs 2.9->4.1 per step) plus 4-6x larger trainer/generator mismatch are consistent with slower or stalled learning; the sweep cannot separate 'quantized rollout policy is weaker' from 'quantized trainer gradient is worse' -- that needs an off-line eval of the same checkpoint under BF16 vs NVFP4 inference (other angles).",
+  "evidence": [
+   {
+    "observation": "Tag inventory and coverage: both runs log the same 81 scalar tags; every tag has exactly 300 steps in 1..300 after later-file-wins de-duplication (BF16 files span 1-70/67-128/126-187/185-251/248-300; NVFP4 1-30/30-71/70-107/106-149/148-190/189-228/227-264/263-300; one empty 88-byte file per run from a launch that logged no steps).",
+    "numbers": "81 tags, 300/300 steps each; 14 replayed steps BF16 (67-70,126-128,185-187,248-251), 13 NVFP4 (30,70-71,106-107,148-149,189-190,227-228,263-264)",
+    "source": "load.py output; /home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/ablation/outputs/<run>/events.out.tfevents.*",
+    "bearing": "Data completeness; handoff steps for the discontinuity check confirmed to match the task's list."
+   },
+   {
+    "observation": "Same prompts at the same step is confirmed at metric level: rollout/prompt_length/mean and /max and generator/num_cached_tokens/mean and /max are numerically identical per step in both runs.",
+    "numbers": "prompt_length/mean cross-run Pearson r = 1.000 in every block; block means 157.1/155.5/157.9 tokens both runs",
+    "source": "table.py, corr_handoff.py; tags rollout/prompt_length/*, generator/num_cached_tokens/*",
+    "bearing": "REFUTES any 'different data stream / skip miscount' explanation; enables paired per-step tests."
+   },
+   {
+    "observation": "Reward block means (target metric) and 20-step means; NVFP4 is lower already in steps 1-20 and never rises.",
+    "numbers": "BF16 0.1217->0.1848->0.2519; NVFP4 0.0773->0.0938->0.0922 (ratio 0.366 in 201-300). 20-step blocks: 1-20 0.091/0.059, 21-40 0.134/0.093, 41-60 0.129/0.086, ..., 281-300 0.276/0.095. Correct samples: 3574 vs 1685 of 19200.",
+    "source": "corr_handoff.py; tag rollout_reward/_mean (identical to rollout_reward/component/RewardMathVerify/mean; _sum = 64*mean)",
+    "bearing": "Establishes the gap is present from the start and widens because BF16 learns, not because NVFP4 degrades."
+   },
+   {
+    "observation": "Paired per-step tests (same prompts) on early steps, while lr is still 1e-6 with warmup 2 and the policy is near the HF base weights.",
+    "numbers": "steps 1-10: diff +0.014, t=+1.45, BF16 higher 7/10; steps 1-20: +0.032, t=+3.70, 17/20; steps 1-30: +0.0385, t=+4.15, 24/30 (217 vs 143 correct of 1920); 1-100: +0.044, t=+8.8, 77/100; 201-300: +0.160, t=+18.3, 97/100. Per-step reward at step 1 (policy_version 0 = HF weights): 0.078 vs 0.031; step 2: 0.047 vs 0.016; step 3: 0.016 vs 0.000.",
+    "source": "early_handoff.py",
+    "bearing": "SUPPORTS an inference-time (rollout-policy) quality deficit of the quantized forward that exists before RL has moved the weights; the first 10 steps alone are not significant, 1-20 and 1-30 are."
+   },
+   {
+    "observation": "Linear trend (OLS slope per 100 steps with t-stat) of the reward/learning-signal family.",
+    "numbers": "reward: BF16 +0.0631 (t=+9.7) vs NVFP4 +0.0076 (t=+1.8); zero-std frac: -0.0619 (t=-5.2) vs -0.0114 (t=-1.0); grad norm +0.0141 (t=+4.4) vs +0.0049 (t=+1.4); loss/mean +0.0058 (t=+4.1) vs -0.0007 (t=-0.6); advantage/_std +0.053 (t=+5.4) vs +0.013 (t=+1.0); reward std +0.052 (t=+9.2) vs +0.012 (t=+1.7)",
+    "source": "more.py",
+    "bearing": "NVFP4 shows no statistically resolvable learning on any signal tag over 300 steps; BF16 does on all of them."
+   },
+   {
+    "observation": "Learning-signal availability: zero-std-group fraction and derived signal groups per step; steps with zero signal groups (grad_norm=0, loss=0).",
+    "numbers": "zero-std frac 0.6325->0.5275->0.4925 (BF16) vs 0.7163->0.7075->0.6975 (NVFP4), ratio 1.42; signal groups/step 2.94->3.78->4.06 vs 2.27->2.34->2.42; steps with all 8 groups zero-std: 2 (BF16) vs 18 (NVFP4); steps with reward_max=0 (no correct sample among 64): 2 vs 18; rollout_reward/_max block means 0.98/1.00/1.00 vs 0.93/0.94/0.95",
+    "source": "corr_handoff.py, more.py; tags rollout_reward/group_zero_std_frac/mean, rollout_reward/_max; ablation_arms.py:108 drop_zero_std_reward_groups=False; training_sample_builder.py:96-101 (zero-std metric), advantage.py:44 (std+1e-6 normalisation -> zero advantage on zero-std groups)",
+    "bearing": "Mechanism/amplifier: NVFP4 takes 6% of its optimizer steps with a literally zero gradient and trains on ~40% fewer groups; but the zero-std gap is itself already present in steps 1-20 (0.762 vs 0.675) so it is downstream of the solve-rate deficit, not its origin."
+   },
+   {
+    "observation": "Within-run correlations tie grad norm/loss/advantage to signal-group count, not to precision-specific tags.",
+    "numbers": "r(grad_norm, zero_std) = -0.838 (BF16) / -0.858 (NVFP4); r(reward, zero_std) = -0.66 / -0.75; r(reward, logprob_diff mean) = -0.002 / -0.005; r(reward, clip frac) = -0.06 / +0.04; r(clip frac, logprob_diff max) = +0.09 / +0.04",
+    "source": "corr_handoff.py",
+    "bearing": "Classifies grad_norm/loss/advantage tags as CONSEQUENCES; shows per-step mismatch magnitude does not predict per-step reward inside the NVFP4 run."
+   },
+   {
+    "observation": "Trainer/generator mismatch family is 4-6x larger in NVFP4, present at full size from step 1, and flat for 300 steps.",
+    "numbers": "bit_wise/logprob_diff/mean: -0.000680/-0.000665/-0.000684 vs -0.00292/-0.00290/-0.00291 (4.26x; slope t=+0.1 / +0.5); logprob_diff/max: 1.05/1.24/1.12 vs 3.59/3.71/3.87 (3.47x); quantiles max BF16 [p10 0.65, p50 0.93, p90 1.64, p99 4.3] vs NVFP4 [1.87, 3.23, 5.66, 11.15]; top peaks NVFP4 36.0 @step 249, 15.05 @202, 12.25 @46, 11.14 @142 vs BF16 14.73 @195, 6.79 @188; loss/ratio_clipped_frac 0.00337/0.00331/0.00320 vs 0.02071/0.02048/0.02052 (6.42x, p1-p99 NVFP4 0.0153-0.0281 never overlaps BF16 0.0023-0.0045); loss/ratio_mean 0.9998 vs 0.9991; bit_wise/ratio_tokens_different 0.533 vs 0.574 (+7.7% only)",
+    "source": "table.py, corr_handoff.py, more.py; formulas at torchtitan/experiments/rl/losses/dapo.py:96-131 (ratio=exp(trainer_lp - generator_lp), clipped_frac counts |ratio-clamp(ratio)|>1e-6 over ALL loss tokens incl. zero-advantage ones; logprob_diff/mean is the k1 estimate of -KL(generator||trainer))",
+    "bearing": "The only >15% tags that could be CAUSES rather than consequences (they precede the reward gap and do not track it). Magnitude: mean 0.0029 nats/token, 2% of tokens outside the clip band; a modest but systematic bias. Cannot decide from tfevents whether this bias is large enough to stall learning."
+   },
+   {
+    "observation": "Clipping is entirely numerical mismatch, not off-policy staleness: rollouts are strictly on-policy in both runs.",
+    "numbers": "train_batch/policy_age/mean = 0 and policy_age_max = 0 on all 300 steps both runs; rollout/min_policy_version/min == rollout/max_policy_version/max == step-1 (block means 49.5/149.5/249.5); trainer/policy_version == step; rollout_buffer/num_groups_{waiting,inflight,finalized} = 0, active_slots_in_use_peak = 8, available_active_slots = 0 every step; train_batch/num_rollout_groups=8, num_training_samples=64, num_metric_only_groups=0 every step",
+    "source": "table.py; ablation_arms.py:103 target_offpolicy_steps=0",
+    "bearing": "REFUTES staleness/async-lag explanations; the 6.4x clip fraction must come from the trainer forward disagreeing with the generator forward on the same tokens."
+   },
+   {
+    "observation": "Both trainer and generator run the 4over6 quantized experts (shared model_spec), so the NVFP4 rollout policy is the quantized model; the recipe's dequantized backward runs bf16 grouped GEMMs on dequantized forward operands.",
+    "numbers": "config_registry.py:798-803 docstring: 'Because the trainer and the vLLM generator share this one model_spec, both actors run the identical four-over-six forward'; four_over_six_grouped.py:37-42: 'dequantized: bf16 grouped GEMMs on dequantizations of the rowwise operands the forward consumed'; ablation_arms.py:126-135: row_scaled_activation=True, err_mode=mse, e4m3_scale_bound=256, weight_block=1x16, layers 0-39 quantized, last 8 BF16 (line 45-51); generator perf confirms a different kernel path: decode_time 1.63x, ITL 1.64x, prefill 1.52x",
+    "source": "/home/scratch.hanlinb_ent_1/repos/titan-nvfp4/torchtitan/experiments/rl/examples/alphabet_sort/config_registry.py; /home/scratch.hanlinb_ent_1/repos/ao-nvfp4/torchao/prototype/moe_training/nvfp4_training/four_over_six_grouped.py; /home/scratch.hanlinb_ent_1/repos/titan-nvfp4/ablation_arms.py (the tree actually mounted: launcher TITAN=/scratch/repos/titan-nvfp4 with -v $SCRATCH:/scratch, run_4x4_fastnic.sh:22,39,61,67)",
+    "bearing": "Makes the step-1 reward deficit interpretable as inference-quality loss of NVFP4 experts on this task, and shows the trainer's 'dequantized' backward is not the same numerics as the vLLM generator kernel (explains the 4x logprob diff even though both are 'the same forward')."
+   },
+   {
+    "observation": "Cross-run per-step correlations: shared prompt difficulty drives reward; trajectory-shaped tags (entropy, length, truncation) are essentially identical.",
+    "numbers": "reward r=0.675 (1-300), 0.77/0.75/0.69 per block, 0.70 steps 1-30; lag controls +1: 0.039, -1: -0.017, +5: 0.021; detrended 0.722; reward std r=0.65; zero-std r=0.49; entropy r=0.967; response_length r=0.960; output_tokens std r=0.957; truncation r=0.895; clip frac r=0.80; grad norm r=0.52; logprob_diff mean r=0.41; logprob_diff max r=0.05",
+    "source": "corr_handoff.py",
+    "bearing": "Confirms the pairing (same prompts) and that entropy/length/truncation are prompt-driven and not precision-driven; REFUTES 'NVFP4 collapses entropy or produces longer/truncated answers' as the cause."
+   },
+   {
+    "observation": "NVFP4 reward conditional on BF16 reward (prompt-difficulty proxy): the NVFP4 deficit is multiplicative across difficulty bins and worsens over time.",
+    "numbers": "1-100: BF16 bin [0,0.1) 0.058->NVFP4 0.042 (0.72x); [0.1,0.2) 0.140->0.084 (0.60x); [0.2,0.3) 0.233->0.153 (0.66x); OLS nvfp4=0.547*bf16+0.011. 201-300: [0.1,0.2) 0.152->0.051 (0.33x); [0.2,0.3) 0.262->0.087 (0.33x); [0.3,0.5) 0.377->0.151 (0.40x); OLS nvfp4=0.385*bf16-0.005",
+    "source": "more.py",
+    "bearing": "The early ~0.6x factor is the near-fixed-weights inference penalty; the late ~0.37x adds the absence of learning. Not an artefact of a few hard prompts."
+   },
+   {
+    "observation": "Handoff/resume artefact check: replayed steps and before/after-handoff means.",
+    "numbers": "Replayed-step pairs (same checkpoint, same prompts, two launches): BF16 n=14, |diff| mean 0.035, std 0.043, r=0.91; NVFP4 n=13, |diff| 0.034, std 0.044, r=0.73; lr, policy_version, prompt_length identical within each pair. 5-step before->after means at NVFP4 handoffs: reward 0.122->0.063 (h30), 0.056->0.069 (70), 0.088->0.100 (106), 0.113->0.072 (148), 0.103->0.091 (189), 0.084->0.097 (227), 0.103->0.109 (263); logprob_diff mean stays -0.0024..-0.0035; clip 0.019-0.022. BF16: 0.131->0.075 (67), 0.206->0.253 (126), 0.225->0.172 (185), 0.197->0.247 (248). First-3-steps-after-resume vs rest: NVFP4 reward 0.073 (n=21) vs 0.089; lpd -0.00289 vs -0.00291; clip 0.0204 vs 0.0206; BF16 reward 0.197 vs 0.186",
+    "source": "early_handoff.py",
+    "bearing": "REFUTES resume artefacts (optimizer/lr/stream) as a contributor: every jump is within the 0.043 sampling-noise floor and mismatch metrics are unchanged across launches. Also gives the per-step noise floor: cross-run diff mean +0.098 (std 0.083) is 2.3 noise-std, and the steps 1-30 diff +0.0385 is ~0.9 noise-std per step but significant in aggregate."
+   },
+   {
+    "observation": "Per-launch (per-node) means: no node-dependent reward or mismatch effect; only decode speed varies by node.",
+    "numbers": "NVFP4 per-launch reward 0.077/0.079/0.078/0.096/0.099/0.084/0.082/0.104, lpd -0.00284..-0.00298, clip 0.0200-0.0211; decode 368-393 s except 449 s on gb-nvl-053-compute04 (steps 227-262, ITL 312 ms vs 264-284); BF16 per-launch reward 0.118/0.136/0.203/0.213/0.276 monotone with step, lpd -0.00067..-0.00068",
+    "source": "more.py",
+    "bearing": "REFUTES hardware/node placement as a reward factor; the 201-300 decode_time rise (408k vs 373k ms) is one slow node, not drift."
+   },
+   {
+    "observation": "Timing/perf tags: the wall-time gap is rollout generation; weight sync identical.",
+    "numbers": "timing/step/total 387.5 vs 642.4 s (1.66x); wait_for_training_batch 364.4 vs 604.1 s (94% of total both); forward_backward 23.1 vs 38.2 s (1.66x); optim 0.090 vs 0.097 s; timing/weight_sync/generator_pull 2.76 vs 3.05 s, trainer_push 0.69 vs 0.69 s; perf/trainer/tokens_per_second_fwd_bwd 4021 vs 2405; step_time_ratio/fwd_bwd 0.060 both",
+    "source": "table.py",
+    "bearing": "UNRELATED to the reward gap (same tokens are generated and trained on); documents that NVFP4 costs 1.66x wall per step in this setup."
+   },
+   {
+    "observation": "Config facts in effect for both arms (from the mounted tree): GRPOLoss symmetric clip 0.2 (not DAPO 0.2/0.28), generator sampling temperature 0.8 / top_p 0.95 / max_tokens 2048, warmup 2 then constant lr 1e-6, AdamW betas (0.9,0.95) eps 1e-8. Optimizer confound: BF16 arm uses default_adamw (weight_decay 0.1 on all params) while every converter arm swaps in _lp_optimizer (weight_decay 0 on layers 0-39 routed experts, 0.1 elsewhere).",
+    "numbers": "config_registry.py:772 GRPOLoss.Config(); :783-787 temperature=0.8, top_p=0.95; ablation_arms.py:115 max_tokens=2048; :61-80 _lp_optimizer; :121-122 applied only if converters; optimizer.py:378-396 default_adamw wd=0.1. lr*wd = 1e-7/step -> 3e-5 cumulative relative shrink over 300 steps",
+    "source": "/home/scratch.hanlinb_ent_1/repos/titan-nvfp4/torchtitan/experiments/rl/examples/alphabet_sort/config_registry.py, ablation_arms.py, torchtitan/components/optimizer/optimizer.py",
+    "bearing": "The weight-decay difference is a real arm-definition confound but numerically negligible at lr 1e-6 over 300 steps; trainer/lr tag confirms identical lr schedule (r=1.000, 9.95e-7/1e-6/1e-6)."
+   }
+  ],
+  "hypotheses_assessed": [
+   {
+    "hypothesis": "H1: The quantized (4over6 NVFP4 experts) forward that the vLLM generator samples from is a weaker math solver than the BF16 model at the same weights, so the NVFP4 run starts with a lower reward/solve rate before RL has done anything.",
+    "verdict": "SUPPORTED",
+    "reasoning": "Both actors share one model_spec so rollouts are sampled from the quantized model (config_registry.py:798-803). At steps 1-3 (policy_version 0-2, lr 5e-7..1e-6) rewards are 0.078/0.047/0.016 vs 0.031/0.016/0.000; paired over steps 1-20 the deficit is +0.032 (t=3.70, 17/20 steps), over 1-30 +0.0385 (t=4.15, 24/30), 217 vs 143 correct of 1920 samples. Zero-std frac is already 0.76 vs 0.68 in steps 1-20. Conditional on BF16 difficulty bin, NVFP4 achieves ~0.6x in 1-100. Caveat: steps 1-10 alone are not significant (t=1.45), so the fixed-weights penalty is inferred from 20-30 steps during which ~20-30 tiny updates occurred; a checkpoint-level BF16-vs-NVFP4 inference eval is needed to nail the size."
+   },
+   {
+    "hypothesis": "H2: NVFP4 learns more slowly because fewer groups carry advantage signal (zero-std groups 0.70 vs 0.49) and 6% of its steps have zero gradient.",
+    "verdict": "PARTIALLY_SUPPORTED",
+    "reasoning": "Mechanism is real and quantified: 2.3-2.4 signal groups/step vs 2.9->4.1; 18 steps with grad_norm=0 vs 2; grad_norm tracks zero-std at r=-0.86. But it is downstream of H1 (the gap exists in steps 1-20) and cannot by itself explain a flat curve: BF16 also started at only 2.9 signal groups/step in block 1 and still climbed (reward slope t=9.7), whereas NVFP4 at 2.3 shows slope t=1.8. So reduced signal is an amplifier/consequence, not the root cause."
+   },
+   {
+    "hypothesis": "H3: The 4-6x larger trainer/generator logprob mismatch (k1 KL -0.0029 vs -0.0007 nats/token, worst-token 3.9 vs 1.1, 2.05% vs 0.32% tokens clipped) biases or nullifies the policy gradient enough to stall learning.",
+    "verdict": "UNDECIDED",
+    "reasoning": "It is the only differing family that is present at full magnitude from step 1 and flat (slopes t<=0.7), i.e. temporally eligible as a cause; policy_age=0 proves the clipping is pure numerical mismatch (trainer 'dequantized' bf16 GEMMs on dequantized operands vs vLLM 4over6 kernel). Against: per-step mismatch does not predict per-step reward inside the NVFP4 run (r=-0.005 mean, +0.04 clip), ratio_mean is 0.9991 (0.09% bias), clipped tokens are 2% and the clipped_frac counts zero-advantage tokens too (dapo.py:117-122), and only 7.7% more tokens differ bitwise (0.574 vs 0.533) -- the difference is in the tail, not the count. tfevents cannot tell whether a 2% clipped / 0.003-nat biased gradient is sufficient to stop learning; that requires a gradient-level experiment (e.g. train with BF16 rollouts + NVFP4 trainer, or NVFP4 rollouts + BF16 trainer)."
+   },
+   {
+    "hypothesis": "H4: Off-policy staleness / async lag differs between the runs.",
+    "verdict": "REFUTED",
+    "reasoning": "train_batch/policy_age mean and max are 0 on all 300 steps in both runs; rollout min/max_policy_version equal step-1; rollout_buffer waiting/inflight/finalized are 0 and 8 slots in use every step; target_offpolicy_steps=0 (ablation_arms.py:103)."
+   },
+   {
+    "hypothesis": "H5: Window-handoff/resume artefacts (optimizer state, lr schedule, prompt stream) damaged the NVFP4 run, which had 8 launches vs 5.",
+    "verdict": "REFUTED",
+    "reasoning": "All 11 handoffs show before/after 5-step reward moves within the replayed-step sampling-noise floor (std 0.043); logprob_diff/clip unchanged across launches; lr, policy_version, prompt_length identical between replayed pairs; first-3-steps-after-resume means equal the rest (NVFP4 reward 0.073 vs 0.089, lpd -0.00289 vs -0.00291). Per-launch NVFP4 reward is flat 0.077-0.104 with no launch-specific outlier."
+   },
+   {
+    "hypothesis": "H6: The runs saw different prompts or a mis-skipped stream.",
+    "verdict": "REFUTED",
+    "reasoning": "rollout/prompt_length mean/max and generator/num_cached_tokens mean/max are bit-identical per step (r=1.000, all blocks)."
+   },
+   {
+    "hypothesis": "H7: NVFP4 changes generation behaviour (entropy collapse, longer/truncated responses, more turns) that lowers reward.",
+    "verdict": "REFUTED",
+    "reasoning": "entropy 0.282 vs 0.286 (r=0.97), response length 1421 vs 1437 (-1.1%, r=0.96), truncation 0.336 vs 0.339 (r=0.90), output_tokens std +2%, num_turns=1 and branches=1 always, padding frac 0.314 vs 0.307. Reward differs 2.7x while all shape tags differ <2.5%."
+   },
+   {
+    "hypothesis": "H8: Optimizer/LR differences between the arms explain the gap.",
+    "verdict": "REFUTED",
+    "reasoning": "trainer/lr identical per step (warmup 5e-7 at step 1, then 1e-6). The only optimizer difference is weight_decay 0 vs 0.1 on routed-expert params in the NVFP4 arm (ablation_arms.py:61-80,121; optimizer.py:394): lr*wd=1e-7/step, 3e-5 cumulative -- negligible; and it acts in the direction of preserving expert weights, not degrading them."
+   },
+   {
+    "hypothesis": "H9: Node/hardware placement or throughput differences affected reward.",
+    "verdict": "REFUTED",
+    "reasoning": "Per-launch reward and mismatch means are flat across 8 NVFP4 node pairs; only decode speed varies (449 s on gb-nvl-053-compute04 vs 368-393 s elsewhere). Perf tags (1.66x step wall, 1.63x decode, 0.60x tokens/s) are unrelated to the number or content of trained tokens."
+   }
+  ],
+  "caveats": "(1) tfevents are aggregates: zero-std fraction cannot be split into all-wrong vs all-right groups, and the per-token clip fraction includes zero-advantage tokens, so '2% of gradient-carrying tokens clipped' is an upper bound. (2) The 'fixed-weights inference penalty' is inferred from steps 1-30 during which 20-30 updates at lr 1e-6 occurred; steps 1-10 alone are not significant (t=1.45, 640 samples per arm). A direct BF16-vs-NVFP4 eval of the same checkpoint is the clean test and outside this angle. (3) The sweep cannot separate rollout-side quantization (weaker sampler) from trainer-side effects (biased/clipped gradient); both are consistent with a flat curve, and only a cross-arm experiment (NVFP4 rollouts + BF16 trainer or vice versa) separates them. (4) Generator logprobs are compared against a trainer computed with temperature 0.8 / top_p 0.95 sampling; whether vLLM reports raw or processed logprobs was not verified here -- it affects both arms equally, so the BF16 value (-0.0007) is the shared floor and only the excess is NVFP4-specific. (5) The task text placed the titan fork at agent_scratch/nvfp4_4over6/repos/titan-nvfp4, which does not exist; the launcher mounts /home/scratch.hanlinb_ent_1/repos/titan-nvfp4 (commit a24a9e08e) and its ablation_arms.py is byte-identical to prcut_worktrees/refactor-v2/ablation_arms.py. (6) The 6x clip-fraction figure uses GRPOLoss clip 0.2 symmetric (config_registry.py:772), not the DAPO 0.2/0.28 the run description implies; the loss is DAPO's per-token surrogate via GRPOLoss wrapper (losses/grpo.py:21-33).",
+  "artifacts": [
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/all_tags_block_means.csv",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/flagged_tags_gt15pct_201-300.csv",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/per_step_all_tags.csv",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/data.pkl",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/load.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/table.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/corr_handoff.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/early_handoff.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/more.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_tfevents_sweep/final_csv.py"
+  ]
+ },
+ {
+  "angle": "Direct checkpoint measurement: HF base weights (w0) vs step-300 DCP weights of arm_bf16_4x4_long and arm_nvfp4_deq_4x4_long \u2014 per-tensor drift, bf16-rounding changes, and NVFP4 4over6 code/scale changes using the real torchao quantizer.",
+  "summary": "The step-300 checkpoints of BOTH runs are almost bitwise identical to the HF base: >99.2% of elements unchanged in every matrix, cosine(w0,w300)=1.000000, relative Frobenius drift 5e-5..2.6e-4, and no element with |w0| >= 2^-11 (4.88e-4) changed anywhere. Root reason (verified from the checkpoint metadata and code): both arms train in full bf16 \u2014 params AND AdamW moments are torch.bfloat16 (TrainingConfig(dtype=\"bfloat16\") at experiments/rl/examples/alphabet_sort/config_registry.py:759, inherited by _ablation_base; configs.py:87-91 says this means no fp32 master copy), so the nominal AdamW step (p50 1.2e-7, max 9.5e-7 at lr 1e-6) is ~1000x smaller than the bf16 ulp of a median weight (0.0156 -> ulp 1.22e-4) and rounds to zero for >99.8% of elements; only near-zero weights (|w0| p50 ~1e-4) move, by up to ~300*lr = 2.5e-4. This contradicts the task premise of fp32 master weights and is a shared limitation of both arms, not a differentiator. Through the real 4over6 quantizer (1x16/mse/256, per-expert amax), quant(w300) differs from quant(w0) in only 0.017-0.043% of FP4 codes, <1e-6 of block scales, 0/128 expert amaxes, with identical 8.69% rel-RMS quantization error at w0 and w300 \u2014 for the BF16 run's weights as well as the NVFP4 run's. So the NVFP4 arm's forward/rollout consumed essentially the step-0 expert weights for all 300 steps, and the accumulated drift (rel 1e-4) is ~3 orders of magnitude below the per-forward NVFP4 quantization noise (rel 8.7e-2). Cross-run: the NVFP4 run drifted 20-26% less (rel-Fro 0.74-0.80x, exp_avg -22%, exp_avg_sq -34%, matching the logged grad-norm gap 0.12 vs 0.17), on largely the same near-zero elements (Jaccard 0.80-0.89) but with different values (identical on 3.3-3.5%, sign agreement 58-71%, drift cosine 0.66-0.72). The reward gap already exists in steps 1-20 (0.091 vs 0.059) when cumulative drift is <= 2e-5 on <1% of elements. Verdict for the user's question: the NVFP4 run did not fail to track BF16 because its weights learned differently \u2014 neither run's weights moved appreciably; the gap is a forward-pass (rollout + trainer forward) quantization-noise effect present from step 1, with a secondary weaker-gradient/less-drift effect downstream of the lower reward variance (more zero-std groups). Whether the BF16 run's own reward rise is caused by its ~1% near-zero-weight drift or by something else cannot be decided from checkpoints.",
+  "evidence": [
+   {
+    "observation": "Checkpoint dtype: every model parameter (1545 tensors) and every AdamW exp_avg/exp_avg_sq tensor is torch.bfloat16 in both parked step-300 checkpoints; only *.step scalars and layers.N.moe.expert_bias_E are float32. HF base is also BF16.",
+    "numbers": "dtype counts per run: bfloat16 1545, float32 531 (steps + expert_bias); e.g. layers.20.moe.routed_experts.inner_experts.w2_EDF [128,2048,768] bf16, optimizer.state....w2_EDF.exp_avg bf16, .step fp32 = 300.0",
+    "source": "metadata_arm_bf16_4x4_long.json / metadata_arm_nvfp4_deq_4x4_long.json (from FileSystemReader(...).read_metadata()); code: titan-nvfp4/torchtitan/experiments/rl/examples/alphabet_sort/config_registry.py:759 training=TrainingConfig(dtype=\"bfloat16\"); torchtitan/config/configs.py:87-91 (dtype=bfloat16 = 'all parameters, gradients, and optimizer states in bfloat16, without an extra copy of fp32 weights'); experiments/rl/actors/trainer.py:298 set_default_dtype; ablation_arms.py:84 _ablation_base inherits it for both arms",
+    "bearing": "REFUTES the task premise 'fp32 model + optimizer state'. Both trainers keep bf16 master weights \u2014 same dtype in both arms, so not a differentiator, but it explains the frozen-weight picture below. Comments claiming 'fp32 master weights' (controller.py:386-393, config_registry.py:862) do not hold for this recipe."
+   },
+   {
+    "observation": "Drift w0 -> w300 is tiny and near-identical across runs: fraction of bf16 elements that changed at all, expert tensors 0.44-0.78%, attention.wo 0.9-1.25%, router.gate 0.4-2.3%, lm_head/tok_embeddings ~0.05%, RMSNorm weights (|w|~1) exactly 0. cosine(w0,w300)=1.000000 for every tensor; relative drift p99 = 0 for all expert tensors.",
+    "numbers": "L20 w2_EDF: BF16 run frac_changed 0.680%, rel-Fro 1.05e-4, abs max 2.60e-4; NVFP4 run 0.639%, 8.04e-5, 2.32e-4. L0 w1: 0.749%/1.18e-4 vs 0.667%/8.98e-5. L39 w3: 0.626%/8.46e-5 vs 0.583%/6.20e-5. L44 (bf16 in both arms) w2: 0.508%/6.35e-5 vs 0.471%/4.93e-5. L20 router.gate 1.31%/1.15e-4 vs 1.25%/9.15e-5. L20 attention.wo 1.06%/1.34e-4 vs 1.00%/1.08e-4.",
+    "source": "drift_results.json, drift_probe_full.log (drift_probe.py); mapping per state_dict_adapter.py:33-50, verified by cosine 1.000000 / >=99.2% bitwise-identical elements for the BF16 run",
+    "bearing": "SUPPORTS: neither run accumulated meaningful weight change in 300 steps. REFUTES any hypothesis that the NVFP4 run's reward gap comes from its weights having diverged/drifted differently (the two step-300 checkpoints differ from each other by rel-Fro 5e-5..2e-4, same order as either drift)."
+   },
+   {
+    "observation": "bf16 dead zone: in all 11 tensors probed for it, no element with |w0| >= 0.000488 (=2^-11) changed in either run; changed elements have |w0| p50 ~1.0e-4, p90 ~2.2e-4 (experts). Fraction changed among |w0|>1e-2 is exactly 0.0. Max absolute drift 2.2-2.6e-4 ~ 300 steps x lr 1e-6.",
+    "numbers": "w0_abs_max_changed = 0.000488 for w1/w2 L20, router L20, wo L20, wq L20, lm_head, tok_embeddings (both runs). L20 w2 AdamW moments at step 300: nominal update lr*m/(sqrt(v)+eps) p50 1.18e-7, p90 3.4e-7, p99 5.9e-7, max 9.5e-7 (BF16 run); median |w|=0.015625 -> bf16 ulp 1.22e-4; only 0.184% (BF16) / 0.172% (NVFP4) of elements have nominal update >= half their ulp.",
+    "source": "overlap_results.json (overlap_probe.py), drift_results.json optimizer_probe",
+    "bearing": "SUPPORTS mechanism: with bf16 params and RTNE, lr=1e-6 updates round to zero for >99.8% of weights in BOTH arms; only near-zero weights learn. Shared limitation \u2014 cannot by itself explain the BF16-vs-NVFP4 difference, but means expert 'learning' in both arms is confined to ~0.6% of elements."
+   },
+   {
+    "observation": "Through the real 4over6 quantizer with the arm's settings, the expert drift is invisible: FP4 codes changed 0.017-0.043% of elements, E4M3 block scales changed in 1-10 of ~12.6M blocks, per-expert amax changed in 0/128 experts, and weight quantization error is identical at w0 and w300.",
+    "numbers": "L20 w2_EDF: codes_changed 3.44e-4 (BF16-run weights) / 2.86e-4 (NVFP4-run weights); scales_changed 3.97e-7 both; amax changed 0; quant err rel-RMS 0.0869 at w0 and 0.0869 at w300 for both runs. Range over 12 expert tensors: codes 1.74e-4..4.33e-4, scales 8e-8..8e-7. Drift rel-Fro ~1e-4 vs quantization noise rel-RMS 8.7e-2 (~870x).",
+    "source": "drift_results.json nvfp4_quant; quantizer = ao-nvfp4 torchao/prototype/moe_training/nvfp4_training/four_over_six.py:180-269 four_over_six_quantize pure-torch body (cutedsl fast path at :221 disabled by monkeypatch) via four_over_six_grouped.py:181-222 _quantize_expert_weights, amax as four_over_six_grouped.py:466 weight.abs().amax(dim=(1,2)); settings weight_block=1x16, err_mode=mse, e4m3_scale_bound=256 from ablation_arms.py:126-135",
+    "bearing": "SUPPORTS: in the NVFP4 arm the forward/rollout consumed effectively step-0 expert weights for all 300 steps (99.97% code-identical); any expert learning is below NVFP4 resolution. Also shows the BF16 run's expert drift would be equally invisible if quantized, i.e. the gap is not 'BF16 learned something in experts that NVFP4 could not represent'."
+   },
+   {
+    "observation": "The NVFP4 run drifted systematically less than the BF16 run, on largely the same eligible elements but in different directions.",
+    "numbers": "rel-Fro ratio NVFP4/BF16 = 0.74-0.80 on all expert tensors, 0.73-0.91 attention/router; changed-element fraction 6-8% lower; exp_avg |mean| 3.04e-8 vs 3.92e-8 (-22%), exp_avg_sq mean 7.06e-14 vs 1.07e-13 (-34%). Jaccard of changed sets 0.85 (experts), 0.80 (wo, router), 0.89 (wq); identical bf16 value on 3.3-3.5% of commonly changed elements; sign agreement 0.58-0.59 experts/router, 0.71 attention; cosine(drift_bf16, drift_nvfp4) 0.66-0.72 (0.17 lm_head, 0.40 embeddings).",
+    "source": "overlap_results.json, drift_results.json optimizer_probe; compare_step-300.json grad norm 0.169 vs 0.12",
+    "bearing": "PARTIALLY SUPPORTS 'weaker learning signal in NVFP4' (smaller moments and drift, consistent with the logged grad-norm gap and higher zero-std fraction) \u2014 but magnitude is only -20-25% of an already negligible drift, so it is a downstream symptom, not a plausible cause of a 2.7x reward gap."
+   },
+   {
+    "observation": "The reward gap is present from the first steps, before any drift could matter.",
+    "numbers": "rollout_reward/_mean BF16 vs NVFP4: steps 1-5 0.069 vs 0.034; 1-10 0.081 vs 0.067; 1-20 0.091 vs 0.059 (1280 samples each); 1-50 0.115 vs 0.076; 1-100 0.122 vs 0.077. Step 1: 0.078 vs 0.031. zero-std frac 1-20: 0.675 vs 0.7625. Cumulative drift possible by step 20 <= 20*lr = 2e-5 on <1% of elements.",
+    "source": "early_reward.json (early_reward.py over events.out.tfevents.*, later file wins on replayed steps)",
+    "bearing": "SUPPORTS forward-pass quantization noise (rollout + trainer forward on 8.7% rel-RMS weight error plus activation quantization) as the origin of the gap; REFUTES accumulated-weight-divergence explanations."
+   }
+  ],
+  "hypotheses_assessed": [
+   {
+    "hypothesis": "The NVFP4 run's weights drifted differently / diverged from the BF16 run's weights over 300 steps, and that divergence explains the reward gap.",
+    "verdict": "REFUTED",
+    "reasoning": "Both step-300 checkpoints are >99.2% bitwise identical to the HF base in every matrix (cosine 1.000000, rel-Fro <= 2.6e-4), and differ from each other by the same negligible amount (rel-Fro 5e-5..2e-4). The NVFP4 run's drift is 20-26% smaller but of the same character (same eligible near-zero elements). Nothing in the weights can account for a 0.25 vs 0.09 reward difference; the gap is already there in steps 1-20."
+   },
+   {
+    "hypothesis": "Trainers keep fp32 master weights (task premise), so weight updates at lr 1e-6 accumulate faithfully.",
+    "verdict": "REFUTED",
+    "reasoning": "Checkpoint metadata shows bf16 params and bf16 AdamW moments in both runs; TrainingConfig(dtype='bfloat16') at config_registry.py:759 (configs.py:87-91: no fp32 copy). Empirically no element with |w0| >= 2^-11 changed in any tensor; only 0.17-0.18% of L20 w2 elements have a nominal AdamW step >= half a bf16 ulp. Full-bf16 training with lr 1e-6 leaves >99% of weights frozen in BOTH arms (shared limitation, not the differentiator)."
+   },
+   {
+    "hypothesis": "NVFP4 quantization of the expert weights masks whatever the trainer learns, so the NVFP4 forward/rollout never benefits from training (expert learning is below FP4 resolution).",
+    "verdict": "SUPPORTED",
+    "reasoning": "quant(w300) vs quant(w0) with the real 4over6 quantizer (1x16/mse/256): 0.017-0.043% of codes changed, <1e-6 of block scales, 0/128 amaxes, identical 8.69% rel-RMS quantization error. The accumulated drift (rel 1e-4) is ~870x below the per-forward quantization noise. In this recipe (bf16 masters + lr 1e-6) the effect is moot for experts in both arms because the drift is negligible anyway, but for the NVFP4 arm it is strictly true that the forward consumed step-0 expert weights."
+   },
+   {
+    "hypothesis": "The reward gap originates in the forward pass (rollout/trainer forward under NVFP4 quantization noise), not in learning dynamics.",
+    "verdict": "SUPPORTED",
+    "reasoning": "Gap present at steps 1-5 (0.069 vs 0.034) and 1-20 (0.091 vs 0.059) when cumulative drift <= 2e-5 on <1% of elements; weight quantization error is a constant 8.69% rel-RMS on every expert forward. This angle cannot measure activation quantization or the generator's rollout numerics directly; it establishes only that weights are not the cause."
+   },
+   {
+    "hypothesis": "The NVFP4 run receives a weaker learning signal (smaller gradients/updates) than the BF16 run.",
+    "verdict": "PARTIALLY_SUPPORTED",
+    "reasoning": "Measured: exp_avg -22%, exp_avg_sq -34%, drift rel-Fro 0.74-0.80x, 6-8% fewer changed elements, consistent with logged grad norm 0.12 vs 0.17 and zero-std fraction 0.70 vs 0.49. But it is a ~25% reduction of an already negligible drift and is most plausibly downstream of the lower reward variance (more all-zero-advantage groups), not an independent cause. Cannot separate cause from effect from checkpoints."
+   },
+   {
+    "hypothesis": "The BF16 run's reward rise 0.12 -> 0.25 is produced by its own weight drift.",
+    "verdict": "UNDECIDED",
+    "reasoning": "Its drift is confined to ~0.5-1.3% of near-zero elements (|w0| < 4.88e-4) moved by <= 2.6e-4, plus ~14% of layer-0 input-norm elements; all RMSNorm gains with |w|~1, embeddings and lm_head are essentially frozen. Whether such a sparse, tiny perturbation across ~300M parameters can raise math reward by 0.13, versus prompt-stream/curriculum effects, cannot be decided from checkpoints alone; a forward-eval of w0 vs w300 on the same prompts would be needed."
+   }
+  ],
+  "artifacts": [
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/RESULTS.md",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/drift_probe.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/drift_results.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/drift_probe_full.log",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/overlap_probe.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/overlap_results.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/early_reward.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/early_reward.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/dump_metadata.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/metadata_arm_bf16_4x4_long.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_checkpoint-drift-experiment/metadata_arm_nvfp4_deq_4x4_long.json"
+  ],
+  "caveats": "(1) Probed 4 layers (0, 20, 39, 44) x {w1,w2,w3, attention.wo, router.gate} plus layer-20 wq, several norms, lm_head and tok_embeddings \u2014 not all 48 layers; the pattern was uniform across every tensor probed. (2) The 4over6 quantization was applied to the checkpointed bf16 weights with the arm's weight settings (1x16, mse, 256, per-expert amax); the runs also quantize activations per token (row-scaled) and the launcher sets FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT=1 \u2014 neither is measured here. Whether the training-time quantizer used the CuTe DSL kernel does not matter: the source states it is bitwise identical to the pure-torch body used here. (3) Quantiles on >16M-element tensors are computed on a deterministic 16M random subsample; fractions, norms, maxima and cosines are exact. (4) The 'nominal AdamW update' uses lr*m/(sqrt(v)+eps) from the step-300 moments without bias correction (negligible at step 300) and is a snapshot, not a per-step history. (5) The weight-decay confound noted in ablation_arms.py (LP arms: wd 0 on experts, 0.1 elsewhere; BF16 arm: default_adamw) is irrelevant at this scale: decoupled decay lr*wd*w = 1e-7*w per step is far below half a bf16 ulp for every weight, and the observed zero-change of all |w|>=4.88e-4 elements confirms no decay landed. (6) 'Same prompts at the same step' was taken from the task statement, not re-verified here. (7) The early-step reward gap (steps 1-20) is from 64 rollouts/step and is noisy; the 1-20 means (1280 samples each) are the most robust early figure."
+ },
+ {
+  "angle": "Paired per-prompt analysis of rollout_samples.jsonl (BF16 arm_bf16_4x4_long vs NVFP4 arm_nvfp4_deq_4x4_long), same seeded prompt stream, steps 1-300",
+  "summary": "FILE CHARACTERISATION. rollout_samples.jsonl holds 5260 (BF16) / 5784 (NVFP4) records, all is_validation=false, one turn, one user prompt message. Prompt text = turns[0].prompt_messages[0].content; response text = turns[0].completion_message.content (there is NO 'response' key). status in {completed, truncated_length}; reward in {0,1} (RewardMathVerify). Step encoding: turns[0].min_policy_version == max_policy_version for every record, and step = policy_version + 1 (validated: the reconstructed per-step mean reward and zero-std fraction match tfevents rollout_reward/_mean and group_zero_std_frac to 0.00000 for all 300 steps with offset +1; offset 0 gives mean-abs-diff 0.11). Only 2 of 8 samples per group are recorded: RolloutSampleRecorder uses KeepExtremeRewardsFilter(k=1) = lowest- and highest-reward rollout per group (rollout_recorder.py:32-61,84), so every step has 8 groups x 2 = 16 records and all 8 prompts are present. Because advantage = (r-mean)/(pstdev+1e-6) (rollout/advantage.py:44-48) and rewards are binary over 8 samples, the full group correct count k/8 is recoverable exactly from (reward, advantage) - residual 0.0 for all 11044 records. Window-handoff replays appear as extra 16-record blocks for the same policy version (BF16 19 pvs, NVFP4 49 pvs incl. the discarded-window-4 duplicates at pv 69-99); replay blocks carry the same 8 prompts; the LAST complete block was used. group_id resets per launch (0..559 / 0..351) so it is not a global key. Prompt alignment across runs is exact: 301/301 pvs (0..300) have identical 8-prompt sets, 2498 common prompts, 0 repeats within a run. Responses are NOT reproducible across runs even at pv=0 with identical HF weights and --generator.debug.seed 42 (0/14 byte-identical, median common prefix 76 chars) - vLLM sampling is nondeterministic across launches.\n\nRESULTS (paired table: 2400 (step,prompt) pairs, CSV saved). (1) Paired reward on the SAME prompts by 50-step block, BF16 vs NVFP4 (diff, bootstrap 95% CI, sign test +/-): 1-50: 0.115 vs 0.076 (-0.038 [-0.052,-0.026], 33/104, p=9e-10); 51-100: 0.129 vs 0.078 (-0.050); 101-150: 0.168 vs 0.092 (-0.077); 151-200: 0.201 vs 0.096 (-0.106); 201-250: 0.230 vs 0.086 (-0.144); 251-300: 0.273 vs 0.098 (-0.175 [-0.200,-0.151], 20/205, p=8e-40); 1-300: 0.186 vs 0.088 (-0.098, Wilcoxon z=-22.6). NVFP4 is flat (0.076-0.098) while BF16 rises 0.115->0.273. (2) Discordance: BF16>=1 correct & NVFP4=0 rises 14% -> 16% -> 24% -> 22% -> 27% -> 26% of prompts per block; the reverse (NVFP4>=1 & BF16=0) falls 5% -> 7% -> 4% -> 3% -> 2% -> 2%; both=0 falls 58% -> 39%; among prompts both solve, BF16 has the higher k in 402 vs 79 cases. (3) Earliest steps: step 1 (pv=0, both exactly HF init) 5/64 vs 2/64; steps 1-10 paired diff -0.014 [-0.034,+0.008], sign 7/17, p=0.064 (not significant); steps 11-20 -0.050 (p<0.001); 21-30 -0.052 (p=0.002); 1-30 -0.0385 [-0.055,-0.022]. Code shows the generator cannot see quantized weights: the trainer pushes self.model.state_dict() (actors/trainer.py:507) and the 4over6 experts subclass only overrides _grouped_mm with dynamic quantization, adding no quantized parameters (components/quantization/nvfp4.py:634-641); the generator has no converter reference. So there is no rollout-side quantization capability gap at init; the gap is a LEARNING gap that becomes detectable after ~10-30 optimizer steps and widens monotonically. (4) Failure modes of NVFP4 reward-0 samples on prompts BF16 solved (n=1032 recorded samples): truncated at 2048-token limit 25.0% (BF16's own reward-0 samples: 40%; tfevents truncation_rate ~0.33 both), completed with no Answer/boxed line 2.4%, degenerate repetition (12-gram duplicate fraction >0.3) 0.48% (BF16 0.36%), 'wrong-but-well-formed' 72.6%. No collapse: median compression ratio 0.356 vs 0.355, in-group wrong-answer agreement 66% vs 63%. KEY SUB-FINDING: the rubric parses with LatexExtractionConfig only, try_extract_without_anchor=False, boxed_match_priority=0 (dapo_math/rubric.py:20-26,37-42); math_verify's latex regexes require a LaTeX environment or \\boxed (parser.py:302-357), so a plain-number 'Answer: 225' is not extractable. Empirically 96.0% (BF16) / 93.0% (NVFP4) of reward-1 samples contain \\boxed, and 18% of the NVFP4 reward-0 samples on BF16-solved prompts end with the RIGHT value in a plain 'Answer: N' line (e.g. step 84 NVFP4 'Answer: 225' reward 0 vs BF16 '\\boxed{225} ... Answer: 225' reward 1; step 249 'Answer: 932' vs '\\boxed{932}'). Unbiased decomposition on the 1174 known-truth prompts (min-recorded sample is an exchangeable draw of a group's reward-0 samples): right-value rate BF16 0.523 vs NVFP4 0.347 (paired -0.176 [-0.202,-0.150]); P(rewarded | right value) BF16 0.546 -> 0.795 across blocks vs NVFP4 0.526 -> 0.498 (flat). \\boxed rate among reward-independent k=0-group samples: both ~7% at steps 1-10; BF16 rises to 23% by 201-300, NVFP4 stays 7-11%. BF16 therefore improves both math accuracy (0.508 -> 0.570) and answer-format compliance (x1.46), NVFP4 improves neither (0.344 -> 0.330; 0.526 -> 0.498); the two factors contribute about equally to the 2.8x reward gap at 251-300 (0.570x0.795=0.453 vs 0.330x0.498=0.164). (5) k/8 histograms 1-300 (k=0..8): BF16 1268/325/235/167/114/100/69/68/54; NVFP4 1689/299/151/105/76/40/23/9/8. Zero-std fraction is all-zero groups: k=0 70.4% vs 52.8%, k=8 0.3% vs 2.2%; by 251-300 BF16 k=0 41.7% / k=8 5.8% vs NVFP4 65.7% / 0.5%. NVFP4 trains on 29% of groups with nonzero advantage vs 45% for BF16 (advantage!=0 fraction of records). (6) Staleness: identical and zero in both runs - jsonl min==max policy version for 100% of records; tfevents rollout/max_policy_version/max = step-1, min==max, train_batch/policy_age/mean = 0 and policy_age_max = 0, trainer/policy_version = step for all 300 steps. Both runs are fully synchronous on-policy.\n\nINTERPRETATION. The paired data refute (a) an init-time quantization/capability gap in the rollouts, (b) degenerate-output collapse, (c) off-policy staleness, and (d) prompt-stream differences (same prompts by construction). They support a pure learning-dynamics gap: the NVFP4 trainer's updates fail to move the policy on either axis the reward rewards (getting the value right, and emitting it in \\boxed/LaTeX so math_verify can extract it), while BF16 improves on both. Why the NVFP4 gradient is ineffective (logprob mismatch -0.0029 vs -0.0007, clip fraction 6x, grad norm lower) is outside this angle.",
+  "evidence": [
+   {
+    "observation": "Recorder keeps only min- and max-reward rollout per group; advantage formula makes k/8 exactly recoverable; step = policy_version + 1",
+    "numbers": "16 records/pv (8 groups x 2); adv->k residual 0.0 for 5260+5784 records; reconstructed per-step reward mean vs tfevents rollout_reward/_mean: mean-abs-diff 0.00000 (max 0.00000) at offset +1 for both runs, 0.113/0.075 at offset 0",
+    "source": "/home/scratch.hanlinb_ent_1/repos/titan-nvfp4/torchtitan/experiments/rl/rollout_recorder.py:32-61,84; torchtitan/experiments/rl/rollout/advantage.py:44-48; scratch analysis_paired_prompts/paired.out (validation block)",
+    "bearing": "Establishes the paired table is exact for correct counts (not a 2-of-8 subsample) and that the file's policy version maps to tfevents step; foundational for all other evidence"
+   },
+   {
+    "observation": "Prompt streams identical across runs; sampling non-reproducible even at identical init weights",
+    "numbers": "301/301 pvs identical 8-prompt sets; 2498 common prompts; 0 within-run repeats; pv=0 responses byte-identical 0/14, median common prefix 76 chars",
+    "source": "analysis_paired_prompts/align.out; identity_excerpts.out",
+    "bearing": "Supports validity of paired design; shows pv=0 differences (5/64 vs 2/64) are sampling noise, not weight differences"
+   },
+   {
+    "observation": "Paired reward gap grows monotonically with training; NVFP4 flat",
+    "numbers": "block diffs NVFP4-BF16: -0.038, -0.050, -0.077, -0.106, -0.144, -0.175 (all bootstrap CIs exclude 0; sign test 1-300: 174 vs 918 prompts, p=1.5e-122; Wilcoxon z=-22.6). NVFP4 paired reward 0.076-0.098 in every block; BF16 0.115->0.273",
+    "source": "analysis_paired_prompts/paired.out section (1); paired_table.csv",
+    "bearing": "Strongly supports a learning gap (H2); refutes 'within noise' framing beyond step ~10"
+   },
+   {
+    "observation": "Early steps: no significant gap in steps 1-10, significant from 11-20 on",
+    "numbers": "steps 1-10: BF16 52/640=0.081 vs NVFP4 43/640=0.067, diff -0.014 CI[-0.034,+0.008], sign 7/17 p=0.064; steps 11-20: 65/640 vs 33/640, -0.050 p<0.001; 21-30: -0.052 p=0.002; step 1 (HF init): 5/64 vs 2/64",
+    "source": "analysis_paired_prompts/paired.out section (3)",
+    "bearing": "Refutes an init-time capability/quantization gap (H1); supports the gap emerging after ~10-30 updates"
+   },
+   {
+    "observation": "Generator serves BF16 master weights in both arms; quantization exists only inside trainer _grouped_mm",
+    "numbers": "trainer pushes self.model.state_dict() (no quantized params exist: FourOverSixGroupedExperts only overrides _grouped_mm); generator.py has zero references to converters/quantization",
+    "source": "/home/scratch.hanlinb_ent_1/repos/titan-nvfp4/torchtitan/experiments/rl/actors/trainer.py:507-533; torchtitan/components/quantization/nvfp4.py:634-641; grep of actors/generator.py",
+    "bearing": "Refutes H1 mechanistically: rollouts cannot be degraded by quantization; any rollout difference must come through trainer updates"
+   },
+   {
+    "observation": "Discordance: prompts BF16 solves but NVFP4 does not grow; reverse shrinks",
+    "numbers": "B>=1&N=0: 14%,16%,24%,22%,27%,26% per block; N>=1&B=0: 5%,7%,4%,3%,2%,2%; both=0: 58%->39%; among both-solved, BF16 higher k 402 vs 79",
+    "source": "paired.out section (2)",
+    "bearing": "Supports H2 (learning gap) and shows NVFP4 is not winning on a complementary prompt subset"
+   },
+   {
+    "observation": "NVFP4 failure modes on BF16-solved prompts are not degenerate",
+    "numbers": "n=1032 reward-0 samples: truncated 25.0%, no final answer 2.4%, repetitive (dup12>0.3) 0.48%, wrong-well-formed 72.6%; BF16 reward-0 samples: truncated 40%, repetitive 0.36%; median compression ratio 0.356 vs 0.355; in-group wrong-answer agreement 66% (NVFP4) vs 63% (BF16); tfevents truncation_rate ~0.33 both; response length 1407-1437 tokens both",
+    "source": "paired.out section (4); identity_excerpts.out; tb_series.json",
+    "bearing": "Refutes H3 (collapse/degeneration); the NVFP4 policy behaves like the BF16 policy at init, just without improvement"
+   },
+   {
+    "observation": "Reward requires a LaTeX/\\boxed answer; plain 'Answer: N' scores 0; BF16 learns this format, NVFP4 does not",
+    "numbers": "reward-1 samples containing \\boxed: 96.0% BF16 / 93.0% NVFP4; of NVFP4 reward-0 samples on BF16-solved prompts, 18% (181/980) have the RIGHT value in a plain Answer line, 57% wrong value, 25% truncated; \\boxed rate among k=0-group samples: steps 1-10 7.1% vs 6.7%, block 251-300 23.1% vs 10.8%; P(reward|right value) on 1174 known-truth prompts: BF16 0.546->0.795, NVFP4 0.526->0.498; right-value rate BF16 0.508->0.570 vs NVFP4 0.344->0.330 (paired -0.176 CI[-0.202,-0.150])",
+    "source": "/home/scratch.hanlinb_ent_1/repos/titan-nvfp4/torchtitan/experiments/rl/examples/dapo_math/rubric.py:20-42; rl_smoke/pydeps_rl/math_verify/parser.py:302-357,573-650; analysis_paired_prompts/format.out, format2.out, decomp.out; excerpts steps 84/249 in identity_excerpts.out",
+    "bearing": "Supports H6: about half of the log reward gap at 251-300 is format-extraction learning (x1.46 for BF16, flat for NVFP4), the other half is math-accuracy learning; both are learning effects"
+   },
+   {
+    "observation": "Zero-std groups are all-zero groups; NVFP4 gets far fewer groups with signal",
+    "numbers": "k=0 frac 1-300: 70.4% NVFP4 vs 52.8% BF16; k=8: 0.3% vs 2.2%; 251-300: k=0 65.7% vs 41.7%, k=8 0.5% vs 5.8%; records with advantage!=0: 29.4% vs 45.5%",
+    "source": "paired.out section (5); characterize.out",
+    "bearing": "Supports H5; consistent with lower grad norm and loss for NVFP4 (fewer nonzero-advantage tokens), a consequence not a cause"
+   },
+   {
+    "observation": "No policy staleness in either run",
+    "numbers": "jsonl min==max policy version 100% of records; tfevents max_policy_version = step-1 (300/300), policy_age mean=max=0 (300/300), trainer/policy_version=step (300/300), identical for both runs",
+    "source": "paired.out section (6); tb_series.json",
+    "bearing": "Refutes H4 (off-policy staleness difference)"
+   }
+  ],
+  "hypotheses_assessed": [
+   {
+    "hypothesis": "H1: NVFP4 rollouts are worse from step 1 because the sampled policy is quantization-degraded (capability gap at HF init)",
+    "verdict": "REFUTED",
+    "reasoning": "Generator receives BF16 master weights in both arms (trainer.py:507 pushes model.state_dict(); nvfp4.py:634 quantizes only inside _grouped_mm); steps 1-10 paired diff -0.014 with CI [-0.034,+0.008], sign 7/17 p=0.064; step 1 (identical weights) 5/64 vs 2/64 with non-reproducible sampling. The gap only becomes significant at steps 11-20 (-0.050, p<0.001)."
+   },
+   {
+    "hypothesis": "H2: The gap is a learning gap - the NVFP4 trainer's updates fail to improve the policy while BF16's do",
+    "verdict": "SUPPORTED",
+    "reasoning": "Paired diff widens monotonically -0.038 -> -0.175 across 50-step blocks; NVFP4 paired reward flat 0.076-0.098 while BF16 0.115 -> 0.273 on the same prompts; NVFP4 improves neither right-value rate (0.344 -> 0.330) nor format compliance (P(reward|right) 0.526 -> 0.498, boxed rate among k=0 groups 7% -> 11%) whereas BF16 improves both (0.508 -> 0.570; 0.546 -> 0.795; 7% -> 23%)."
+   },
+   {
+    "hypothesis": "H3: NVFP4 fails through degenerate outputs (truncation at the token limit, repetition, missing final answer)",
+    "verdict": "REFUTED",
+    "reasoning": "NVFP4 reward-0 samples on BF16-solved prompts: 25% truncated (BF16's own reward-0: 40%), 0.48% repetitive (BF16 0.36%), 2.4% no answer marker; compression ratio and response length match BF16; tfevents truncation_rate ~0.33 for both. Failures are well-formed wrong (57%) or right-but-unextractable (18%) answers."
+   },
+   {
+    "hypothesis": "H4: A policy-version staleness (off-policy) difference explains the gap",
+    "verdict": "REFUTED",
+    "reasoning": "Both runs are fully synchronous: min==max policy version in 100% of records, tfevents policy_age mean/max = 0 and max_policy_version = step-1 for all 300 steps in both runs."
+   },
+   {
+    "hypothesis": "H5: NVFP4's higher zero-std fraction comes from all-zero groups (no learning signal), not from saturation",
+    "verdict": "SUPPORTED",
+    "reasoning": "k=0 groups 70.4% vs 52.8% (1-300), k=8 groups 0.3% vs 2.2%; NVFP4 has nonzero advantage on 29% of rollouts vs 45% for BF16. This is a consequence of not learning rather than an independent cause, but it compounds: fewer informative groups per step."
+   },
+   {
+    "hypothesis": "H6: Part of the reward gap is answer-FORMAT learning (the rubric only extracts LaTeX/\\boxed answers), which BF16 acquires and NVFP4 does not",
+    "verdict": "SUPPORTED",
+    "reasoning": "rubric.py uses LatexExtractionConfig only with try_extract_without_anchor=False; math_verify's regexes need a LaTeX env or \\boxed, so plain 'Answer: 225' is unextractable (code reading; sympy unavailable on host so not executed live). Empirically 96%/93% of reward-1 samples contain \\boxed; 181 NVFP4 reward-0 samples on BF16-solved prompts have the right plain-text value; P(reward|right) rises 0.55 -> 0.80 for BF16 and stays ~0.50 for NVFP4. Roughly half the log gap at 251-300 (0.570x0.795 vs 0.330x0.498)."
+   },
+   {
+    "hypothesis": "H7: The runs saw different or differently-hard prompts",
+    "verdict": "REFUTED",
+    "reasoning": "301/301 policy versions have identical 8-prompt sets across runs (2498 common prompts, 0 repeats); all comparisons here are paired on identical prompts."
+   },
+   {
+    "hypothesis": "H8: Why the NVFP4 trainer's gradient is ineffective (logprob mismatch, clipping, gradient quality)",
+    "verdict": "UNDECIDED",
+    "reasoning": "Outside this angle: rollout samples show the policy does not move on either the accuracy or the format axis, but cannot distinguish among trainer-side causes (trainer-generator logprob diff -0.0029 vs -0.0007, clip fraction 0.021 vs 0.003, dequantized-backward gradient error)."
+   }
+  ],
+  "caveats": "Only 2 of 8 samples per group are recorded (min- and max-reward), so k/8 is exact but all text-based statistics (failure modes, boxed rates, right-value rates) are from recorded samples; the min sample is an exchangeable draw from a group's reward-0 samples (stable sort), so the population decomposition is unbiased conditional on that, while the naive 'all recorded samples' tables (format.out table B) are selection-biased toward reward-1 for the run with more solved groups and should not be quoted. 'Right value' is my regex on the last Answer:/Final Answer: line with light normalization, compared by string equality to a reward-1 sample's value - not math_verify; equivalent-but-differently-written values are undercounted, so right-but-unrewarded rates are lower bounds. sympy is not available on the host, so math_verify was read (parser.py) rather than executed; the claim that plain 'Answer: N' is unextractable rests on code reading plus 181 empirical right-value/reward-0 cases plus 96%/93% \\boxed among reward-1 samples. Known-truth prompts (1174/2400) are those where either run scored >=1 - an easier subset, but identical for both runs. Multiple windows/blocks were tested without correction; per-prompt units are independent within a step but consecutive steps share nearly the same policy. Generator sampling is non-reproducible across launches, so step-1 comparisons are noise-limited. Replayed policy versions were resolved by taking the last complete 16-record block; NVFP4 pv 69-99 appear twice or three times (discarded window 4), consistent with CHAINED_RUNS.md.",
+  "artifacts": [
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/paired_table.csv",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/paired.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/paired.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/characterize.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/align.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/identity_excerpts.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/format.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/format2.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/decomp.out",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/nvfp4_failures_on_bf16_solved.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_paired_prompts/tb_series.json"
+  ]
+ },
+ {
+  "angle": "Code-level trace of the NVFP4 (4over6, dequantized-backward) arm in trainer and generator + quantitative dead-zone estimate, verified against the real step-300 checkpoints of both runs",
+  "summary": "Within this angle the reward gap decomposes into one decisive, measured fact and one plausible-but-undecidable contributor.\n\nDECISIVE (measured on the parked step-300 DCP checkpoints vs the HF init): BOTH runs train with bf16 master weights, not fp32 (TrainingConfig(dtype=\"bfloat16\") in the shared base config; configs.py L87-91 documents \"all parameters, gradients, and optimizer states in bfloat16, without an extra copy of fp32 weights\"; DCP metadata dtype=torch.bfloat16 for params and Adam moments; 172 GiB = 6.0 B/param). At lr 1e-6 an Adam-normalized update (|update| <= ~lr) is below half a bf16 ulp for every element with |w| >= 2^-12 = 2.44e-4 (median expert |w| = 0.015, half-ulp 3.05e-5 = 30x lr), so it is rounded away every step with no residual. Result after 300 steps: 99.3% of expert-weight elements and ~99% of attention elements are bitwise identical to HF in BOTH arms; 98.6-99.4% of the elements that did change had |w_init| < 2.44e-4 (max 4.88e-4 = 2^-11); Adam exp_avg/exp_avg_sq are 100% nonzero, i.e. gradients arrived and were discarded at the bf16 store. The only learning channel in either arm is the ~0.9% of \"tiny\" elements.\n\nThat channel is what separates the arms. In the NVFP4 arm the 4over6 forward quantizes expert weights per expert (global amax) in 1x16 E2M1 blocks with E4M3 scales; the zero bin is |w| < block_amax/24 ~ 2e-3 (median block amax 0.046), so 100% of the tiny elements quantize to code 0 (simulated: tiny_frac_fp4_nonzero = 0.0). Quantizing the step-300 NVFP4 expert weights with a numpy reimplementation of the reference quantizer gives fp4 codes changed = 4.2e-7 (12 of 12,582,912 in the L12 w1 sample, all in ONE block whose 4/6 candidate flipped because a tiny neighbour moved; the block's non-tiny weights are bitwise unchanged), 0 expert amax changed. The fp4 expert operands that both the trainer forward and the vLLM generator compute with are therefore frozen at init for layers 0-39 (79.1% of params, ~45% of active FLOPs/token). The BF16 arm's 170M moved expert elements (0.70% of 24.2B) do enter its bf16 GEMMs. Counting changed elements the forward can see: BF16 ~206M vs NVFP4 ~34M (6x fewer; NVFP4's visible changes are only tail-layer experts, attention, router, embeddings, each also 4-15% smaller than BF16's).\n\nThis corrects the premise: the freeze is NOT the E2M1/E4M3 grid coarseness per se. With fp32 masters and consistent 1e-6/step updates (3e-4 after 300 steps) the simulation flips 11.9% of fp4 codes (4.3% at 1e-4) -- the fp4 forward would have moved. It is the bf16-master dead zone (shared by both arms) plus the fp4 zero bin swallowing the only movable elements (NVFP4-specific).\n\nTrainer/generator consistency: the generator builds the same converted model_spec (only attention/GDN configs are replaced for vLLM), receives the trainer's bf16 weights uncast, and requantizes dynamically on every forward with the same code path and env knob; sampling policy == trainer policy up to kernel numerics. Runs are strictly on-policy (policy_age 0), so every ratio != 1 is numerics mismatch: NVFP4 mean log-ratio -2.9e-3 vs -6.8e-4, ratio_mean 0.99914 vs 0.99982, clip fraction 2.06% vs 0.33%, tokens-different 57% vs 53%, |diff| max median 3.2 vs 0.9, 44 vs 2 steps with max > 5. Mechanically: clipped tokens contribute exactly zero gradient (2% of tokens dropped), mean bias is 0.09%, and the e^10-amplified case (A<0, ratio>1.2) never materialized (grad_norm max 0.254 < max_norm 1.0, clipping never engaged). Whether this 2%/spike mismatch contributes to the reward gap cannot be decided from this angle; the spike sign is not logged.\n\nWhat the NVFP4 arm can still learn: attention (2.97%), embeddings+lm_head (2.04%), router (0.04%), tail-layer experts (15.8%) -- 20.9% of parameters -- but only through the same ~1% tiny-element channel, and its changed-element counts run 4-15% below BF16's in every class (consistent with grad norm 0.12 vs 0.17 and 30% vs 50% informative groups).",
+  "evidence": [
+   {
+    "observation": "Arm selection and knobs for the two chained runs: NVFP4 chain runs ARM default arm_nvfp4_deq; BF16 chain exported ARM=arm_bf16. arm_nvfp4_deq = NVFP4GroupedExpertsConverter(fqns=layers.0.-layers.39., row_scaled_activation=True, err_mode=\"mse\", e4m3_scale_bound=256, weight_block=\"1x16\", backward_override=\"dequantized\", pad_multiple=128); AdamW lr 1e-6 betas (0.9,0.95) eps 1e-8, weight_decay 0.0 on layers.0-39 routed_experts params and 0.1 elsewhere; BF16 arm uses default_adamw (wd 0.1 everywhere); advantage std-normalized with +1e-6; zero-std groups kept (advantage 0).",
+    "numbers": "48 layers, last 8 bf16; lr 1e-6; wd 0/0.1; 8 prompts x 8 samples; the module on the container PYTHONPATH is /home/scratch.hanlinb_ent_1/repos/titan-nvfp4/ablation_arms.py (byte-identical to the perf_worktrees and prcut_worktrees copies)",
+    "source": "/home/scratch.hanlinb_ent_1/repos/titan-nvfp4/ablation_arms.py L51, L59, L61, L64-79, L98, L108, L126-135, L167-168; /home/scratch.hanlinb_ent_1/agent_scratch/nvfp4_4over6/ablation/run_4x4_fastnic.sh L21-23, L39, L74, L88-95; CHAINED_RUNS.md section 'Second chain' (ARM=arm_bf16); torchtitan/components/optimizer/optimizer.py L385-399 (default_adamw)",
+    "bearing": "Establishes the exact recipe; both arms share everything except the converter and the expert weight decay (which is a no-op anyway, see bf16 dead zone)."
+   },
+   {
+    "observation": "Learning-rate schedule verified from tfevents: warmup step 1 at 5e-7, then constant 1e-6 through step 300 in both runs (window_chain_main.sh passes total-steps 100000 decay-ratio 0.0).",
+    "numbers": "trainer/lr: step1 5.0e-7, steps 2..300 1.0e-6 (both runs)",
+    "source": "events.out.tfevents.* under ablation/outputs/{arm_bf16_4x4_long,arm_nvfp4_deq_4x4_long}; window_chain_main.sh L186",
+    "bearing": "Confirms the per-step update scale assumed in the dead-zone estimate."
+   },
+   {
+    "observation": "MASTER WEIGHTS ARE BF16 IN BOTH ARMS. Base config sets training=TrainingConfig(dtype=\"bfloat16\"); the docstring: 'setting training_dtype=bfloat16 will put all parameters, gradients, and optimizer states in bfloat16, without an extra copy of fp32 weights'. Model is built under set_default_dtype(bf16); FSDP mixed_precision_param bf16 = param dtype (no cast). Optimizer implementation default 'fused' (torch fused AdamW on bf16 params, single bf16 store per step); no master-weight or stochastic-rounding mechanism exists in the optimizer container.",
+    "numbers": "DCP .metadata: params dtype torch.bfloat16, exp_avg/exp_avg_sq torch.bfloat16, step float32; checkpoint 172 GiB / 30.53B params = 6.0 B/param (bf16 param + 2 bf16 moments)",
+    "source": "torchtitan/experiments/rl/examples/alphabet_sort/config_registry.py L753-765; torchtitan/config/configs.py L87-91, L94-97; torchtitan/experiments/rl/actors/trainer.py L297-299, L118-122; torchtitan/components/optimizer/optimizer.py L109-124, L241-242; ablation/outputs/arm_bf16_4x4_long/parked/step-300/.metadata (read via scratch dcp_meta2.py)",
+    "bearing": "REFUTES the fp32-master premise of the question; foundation of the dead-zone result."
+   },
+   {
+    "observation": "HF base expert weights: median |w| ~0.015, 1st percentile ~2.8e-4, 99th ~6e-2, max 0.13-0.37; fraction with |w| < 2^-12 = 2.44e-4 is 0.82-0.92% (router gate 1.3%). bf16 ulp at 0.015 is 2^-14 = 6.1e-5, half-ulp 3.05e-5 = 30x lr; an Adam-normalized update (<= ~lr = 1e-6) survives round-to-nearest only if |w| < 2^-12.",
+    "numbers": "L0 e0 gate_proj median 1.495e-2, q01 2.73e-4, q99 6.05e-2, max 0.208, frac<2.5e-4 0.92%; L20 q_proj median 1.556e-2; L20 router median 1.06e-2 max 1.40",
+    "source": "scratch hf_read.py on miles_smoke/models/Qwen3-30B-A3B/model-*.safetensors (bf16 header+raw parse)",
+    "bearing": "Quantifies the bf16 dead zone: ~99.1% of elements cannot move at lr 1e-6."
+   },
+   {
+    "observation": "MEASURED weight movement step-300 vs HF init (chunk 0 = experts 0-31 of layers 0,12,24,36,39 [quantized] and 44 [bf16 tail]; attention wq full / wo chunk; router chunk; embeddings/lm_head chunk 0; norms). Both arms: ~99.3% of expert elements bitwise unchanged; nearly all changed elements were 'tiny'.",
+    "numbers": "Experts L0-39 changed: BF16 0.704% (0.630-0.759%), NVFP4 0.652% (0.582-0.697%); changed elements with |w_init|<2^-12: 98.6% (BF16) / 99.4% (NVFP4); max |w_init| among changed = 4.883e-4 (=2^-11) in every tensor; non-tiny changed fraction 3e-5..1.2e-4; |delta| median 6-7e-6, q90 ~3e-5, max 2.5e-4. Tail experts L44: 0.55% vs 0.51%. Attention wq/wo: 0.82-1.29% vs 0.80-1.26%. Router: 0.41-2.49% vs 0.39-2.41%. tok_embeddings 0.164% vs 0.140%; lm_head 0.158% vs 0.136%; RMSNorm weights 0.0% (except layer-0 attention_norm 13.9%/12.9%, whose weights are 11.6% tiny). NVFP4 shows 4-15% fewer changed elements than BF16 in every class.",
+    "source": "scratch compare_ckpt.py -> compare_ckpt_results.json / compare_ckpt.log (reads parked/step-300/__k_0.distcp via DCP metadata offsets)",
+    "bearing": "SUPPORTS bf16 dead zone in BOTH arms; refutes 'BF16 arm's weights move normally'. The consistent NVFP4 deficit is consistent with its weaker gradient signal."
+   },
+   {
+    "observation": "Adam moments at step 300 are nonzero for every element of the sampled expert and attention tensors in both arms, i.e. gradients reached every element but the bf16 parameter store discarded the updates.",
+    "numbers": "L12 w1_EFD exp_avg nonzero 100%, median |exp_avg| 9.3e-9 (BF16) / 7.7e-9 (NVFP4), exp_avg_sq median 6.6e-15 / 4.1e-15; L12 wqkv exp_avg median 6.2e-8 / 4.7e-8; L44 w1 4.8e-9 / 3.4e-9",
+    "source": "compare_ckpt_results.json optstate.* entries",
+    "bearing": "Supports the mechanism (update rounded away, not absent gradient); NVFP4 moments ~20-40% smaller."
+   },
+   {
+    "observation": "Quantizing the real step-300 expert weights with the 4over6 recipe (per-expert amax, 1x16 blocks, E2M1 RTNE, E4M3 scales, bound 256, mse) shows the fp4 codes are unchanged from init in both arms; in the NVFP4 arm this IS the forward's operand. The 12 changed codes in the L12 w1 sample lie in a single 16-block (expert 7, row 155, cols 1680-1695) whose map-to-4/map-to-6 choice flipped because one tiny element moved; the block's non-tiny weights are bitwise identical. (The 3e-4 'deq bf16 changed' column in the log is a -0.0/+0.0 sign-of-zero artifact of tiny elements flipping sign; numerically different deq values: 8 of 12.58M.)",
+    "numbers": "fp4 codes changed mean 4.2e-7 (NVFP4) / 4.7e-7 (BF16 weights), max 1.75e-6 (22 codes of 12.58M); scales changed <=1.3e-6; expert amax changed 0 of 8 in every sample; L12 w1 NVFP4: 12 codes / 12,582,912; simulated tiny elements with nonzero fp4 code: 0.0%",
+    "source": "compare_ckpt_results.json fp4_* fields; scratch fo6_np.py reimplementing ao-nvfp4 four_over_six.py L105-119, L122-130, L133-165, L180-269 and four_over_six_grouped.py L181-223, L432-452",
+    "bearing": "SUPPORTS 'quantized expert weights seen by the forward are frozen'; and shows the BF16 arm's expert changes would also be invisible under fp4 -- the freeze is the fp4 zero bin acting on the bf16-dead-zone survivors."
+   },
+   {
+    "observation": "Drift simulation on L12 gate_proj experts 0-7 (12.58M elements): the E2M1 grid spacing is 33-100% between representable values, E4M3 scale spacing 12.5%, bf16 0.39-0.78%. Uniform relative scaling changes no codes (recipe is scale-invariant). Random-sign relative drift 0.1%/1%/3%/10% flips 1.3%/11.1%/22.4%/41.3% of codes (bf16 changes 0%/100%/100%/100%). Absolute random-sign drift 1e-6/1e-5/1e-4/3e-4/1e-3 flips 0.058%/0.33%/4.3%/11.9%/31.0% of codes with fp32 masters, but 0.0%/0.098%/3.3%/10.9%/30.7% after bf16-master rounding; bf16 elements changed 1.7%/13.8%/83%/100%/100%. Recipe stats: 44.9% of blocks pick map-to-4; 8.2% codes zero; 5.5% |code|=7; relative RMSE 8.7%; median block amax 0.046; expert amax 0.13-0.32.",
+    "numbers": "see observation; 300 steps x 1e-6 consistent = 3e-4 -> 11.9% codes would flip with fp32 masters; with bf16 masters the per-step 1e-6 never accumulates (0.0%)",
+    "source": "scratch drift_sim.py -> drift_sim_results.json",
+    "bearing": "PARTIALLY REFUTES 'E2M1 coarseness freezes the weights': the fp4 grid alone would let ~12% of codes move over 300 consistent steps; the observed freeze needs the bf16-master dead zone."
+   },
+   {
+    "observation": "Parameter accounting (torchtitan _30b_a3b: dim 2048, 48 layers, 32/4 heads x128, 128 experts x 768, top-8, vocab 151936): quantized experts (layers 0-39) 24.16B = 79.1%; tail experts 4.83B = 15.8%; attention 0.906B = 2.97%; router 12.6M = 0.04%; embeddings+lm_head 0.622B = 2.04%; non-quantized total 6.37B = 20.9%; quantized experts are ~45% of active params per token. Changed elements visible to the forward at step 300: BF16 ~206M (170M in L0-39 experts, 26M tail experts, 9M attention, 1M emb/head, 0.2M router) vs NVFP4 ~34M (0.01M, 24M, 8.6M, 0.9M, 0.2M).",
+    "numbers": "6x fewer visible changed elements in NVFP4; 83% of BF16's moved elements sit in tensors the NVFP4 forward reads as fp4 codes",
+    "source": "torchtitan/models/qwen3/__init__.py L516-554; analytic count + compare_ckpt_results.json fractions",
+    "bearing": "Quantifies the frozen fraction and which parameters can still change in the NVFP4 arm."
+   },
+   {
+    "observation": "Forward quantization in the trainer (4over6 grouped path): input rows padded to 128 per expert; activations quantized 1x16 with a per-token-ROW global amax (row_scaled_activation=True), weights quantized per expert with a per-expert global amax and 1x16 blocks; global encode scale = 256*6/amax; block scale = e4m3((block_amax/6)*s_enc) [map-to-6] or e4m3(1.5x that) [map-to-4], chosen per block by lower fp32 MSE dequant error, ties -> map-to-6; E2M1 codes by round-to-nearest-even (cvt.rn.satfinite emulation); no stochastic rounding anywhere in the 4over6 path (SR exists only in the RHT/Hadamard kernels, unused here). GEMM: F.scaled_grouped_mm on fp4 x fp4 with swizzled E4M3 scales, output scaled by raw per-row amax; with FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT=1 (set in both containers) the fused bf16-output path is used when the build cannot emit fp32.",
+    "numbers": "block 16; E2M1 max 6; E4M3 bound 256 (max 448); pad 128",
+    "source": "ao-nvfp4 torchao/prototype/moe_training/nvfp4_training/four_over_six.py L105-119, L122-130, L133-165, L180-269; four_over_six_grouped.py L83-90, L432-452, L463, L468-502; run_4x4_fastnic.sh L74; rl_smoke/start_gen_worker_fastnic.sh L38; nvfp4.py L351 ('no stochastic rounding: the recipe targets RL')",
+    "bearing": "Trace facts for question (1)."
+   },
+   {
+    "observation": "'dequantized' backward: forward saves only fp4 codes/scales/amaxes; backward dequantizes x and W to bf16 and runs bf16 torch._grouped_mm for grad_input = dY @ deq(W) and grad_weight = dY^T @ deq(X); grad_output is bf16 and never quantized; the gradient flows to the bf16 master weight as a straight-through identity (autograd returns grad_weight for the bf16 weight input). Grouped 4over6 has no quantized backward (rejected).",
+    "numbers": "L560-604 backward; grad_output.to(bf16) L561",
+    "source": "four_over_six_grouped.py L35-41 (docstring), L376-386, L538-556, L560-604",
+    "bearing": "Trace facts for question (1): gradients are not quantized; 'deq' = both backward GEMM operands are the dequantized forward operands."
+   },
+   {
+    "observation": "Converter scope: NVFP4GroupedExpertsConverter converts only GroupedExperts.Config nodes whose FQN contains one of layers.0.-layers.39. and swaps the token dispatcher (pad 128); attention, dense MLP, shared experts (none in Qwen3-30B-A3B), router gate, embeddings, LM head, and layers 40-47 experts stay bf16. The class replaces only _grouped_mm with torchao's _quantize_then_scaled_grouped_mm -> four_over_six_grouped_mm.",
+    "numbers": "40 of 48 layers' experts converted",
+    "source": "torchtitan/components/quantization/nvfp4.py L649-655, L746-776, L580-646; ao-nvfp4 torchao/prototype/moe_training/utils.py L410-439",
+    "bearing": "Trace facts for question (1)."
+   },
+   {
+    "observation": "Generator side: the controller hands the same converted model_spec to the VLLMGenerator; register_to_vllm builds VLLMModelWrapper from model_spec.model with _replace_vllm_layer_configs, which swaps only attention (and GDN) inner configs, so the NVFP4FourOverSixGroupedExperts config is retained and vLLM runs the identical quantized forward (torch.no_grad path of the same autograd Function). Weight sync pushes the trainer's bf16 state dict uncast (transfer cast only when generator dtype != training dtype; both bf16), so the generator requantizes bf16 weights dynamically on every forward with the same recipe, kernels, and env knob. The config docstring states this train/inference-consistency intent explicitly.",
+    "numbers": "model_dtype bfloat16; generator EP4/TP2/DP2; trainer EP4/TP2/dp_shard2; per-expert amax and per-row activation amax are sharding-independent",
+    "source": "controller.py L609, L626; actors/generator.py L831-848, L887; models/vllm_wrapper.py L57-91, L306, L367; actors/trainer.py L118-122, L501-522; config_registry.py L798-803",
+    "bearing": "SUPPORTS 'sampling policy == trainer policy up to kernel numerics' for question (2)."
+   },
+   {
+    "observation": "Trainer-generator mismatch metrics, steps 1-300 (per-step means), runs are strictly on-policy so ratio != 1 is pure numerics: NVFP4 vs BF16 \u2014 logprob_diff mean -2.91e-3 vs -6.76e-4; loss/ratio_mean 0.99914 vs 0.99982; clip fraction 2.06% vs 0.33% (max 3.32% vs 0.52%); tokens with |diff|>1e-6 57.4% vs 53.3%; |diff| max per step: median 3.23 vs 0.93, q99 11.2 vs 4.3, max 36.0 vs 14.7; steps with max>5: 44 vs 2; generator_logprob_nan_frac 0 both; grad_norm max 0.254 vs 0.324 (max_norm 1.0 never engaged); advantage std 0.51 vs 0.65; 64 samples/8 groups per step both, 0 metric-only groups.",
+    "numbers": "see observation",
+    "source": "scratch tf_aux.py -> tf_aux.json; loss code torchtitan/experiments/rl/losses/dapo.py L20, L88-105 (log-ratio clamp +-10, clip [0.8,1.2], -min(ratio*A, clipped*A), denominator global_valid_tokens), grpo.py L26 (clip_eps 0.2); training_sample_builder.py L94-104; advantage.py L44; configs.py L64 max_norm",
+    "bearing": "Question (4): clipped tokens (2%) have exactly zero gradient; mean importance-weight bias 0.09%; the A<0 & ratio>1.2 amplification (up to e^10) never showed up in grad norm; contribution to reward gap UNDECIDED."
+   }
+  ],
+  "hypotheses_assessed": [
+   {
+    "hypothesis": "The quantized expert weights seen by the NVFP4 forward pass are effectively frozen at lr 1e-6 over 300 steps while the BF16 arm's expert weights move.",
+    "verdict": "SUPPORTED",
+    "reasoning": "Measured on the step-300 checkpoints: fp4 codes of the NVFP4 arm's expert weights differ from init in 4.2e-7 of elements (12 of 12.58M in the L12 w1 sample, one block's 4/6 flip), 0 expert amax changed \u2014 the fp4 operands are frozen. The BF16 arm's experts changed in 0.70% of elements (170M elements across layers 0-39) and those enter its bf16 GEMMs. Nuance: 'move' is generous \u2014 99.3% of BF16's expert elements are also bitwise frozen; the arms differ only in whether the ~0.7% tiny-element updates are visible (bf16 GEMM: yes; fp4 zero bin: no)."
+   },
+   {
+    "hypothesis": "Master weights are fp32 and per-step updates of ~1e-6 accumulate (up to 3e-4 after 300 steps).",
+    "verdict": "REFUTED",
+    "reasoning": "TrainingConfig(dtype=\"bfloat16\") puts params, grads and Adam moments in bf16 with no fp32 copy (configs.py L87-91); DCP metadata shows bf16 params/moments and the 172 GiB checkpoint is 6 B/param. Updates <= 1e-6 are below half-ulp for |w| >= 2.44e-4 (~99.1% of elements) and are lost with no residual; observed: 99.3% of expert and ~99% of attention elements bitwise unchanged after 300 steps in both arms, changed elements 98.6-99.4% tiny, max changed |w_init| exactly 2^-11."
+   },
+   {
+    "hypothesis": "The coarse E2M1 (33-100%) / E4M3 (12.5%) spacing is what makes the fp4 weights insensitive to lr-1e-6 drift.",
+    "verdict": "PARTIALLY_SUPPORTED",
+    "reasoning": "Simulation with fp32-style accumulation: absolute random-sign drift of 1e-4 / 3e-4 flips 4.3% / 11.9% of fp4 codes, random-sign relative drift of 1% flips 11%; so over 300 consistent 1e-6 steps the fp4 forward would NOT have been frozen by grid coarseness alone. What freezes it is the bf16-master dead zone (shared by both arms) combined with the fp4 zero bin (|w| < block_amax/24 ~ 2e-3) that swallows 100% of the only movable elements (|w| < 2.44e-4). Grid coarseness matters only as a 8.7%-RMSE forward noise floor, not as the freezing mechanism."
+   },
+   {
+    "hypothesis": "Trainer and generator run the same quantized policy function (same recipe, scale selection, kernels), so the sampling policy equals the trainer policy up to kernel numerics.",
+    "verdict": "SUPPORTED",
+    "reasoning": "Same converted model_spec on both actors (controller.py L609/L626; generator.py L844; vllm_wrapper.py replaces only attention/GDN configs), bf16 weights synced without cast (trainer.py L118-122, L501-522), dynamic requantization every forward with per-expert weight amax and per-row activation amax (sharding-independent), same FOUR_OVER_SIX_GROUPED_ROW_SCALED_FUSED_BF16_OUT=1 in both containers. Residual differences come from attention kernels, GEMM accumulation order and bf16 rounding \u2014 the same sources present in the BF16 arm (53% of tokens already differ there)."
+   },
+   {
+    "hypothesis": "The trainer-generator mismatch (2% clip fraction, -0.003 mean log-ratio, |diff| spikes up to 36) is what prevents the NVFP4 arm from learning.",
+    "verdict": "UNDECIDED",
+    "reasoning": "Mechanics are clear: strictly on-policy (policy_age 0), so all ratio deviation is numerics; clipped tokens (2.06% vs 0.33%) contribute exactly zero gradient; mean ratio bias is 0.09% (0.99914); the dangerous A<0 & ratio>1.2 amplification would show as grad-norm spikes but grad_norm max is 0.254 (< max_norm 1.0, never clipped), and negative spikes (trainer far below generator) fall into zero-gradient or ~0-weight branches. The mismatch is plausibly amplified by the discontinuous quantizer acting on slightly different activations (interpretation). Its effect on reward cannot be quantified from this angle; the sign of the max spikes is not logged."
+   },
+   {
+    "hypothesis": "Attention, router, embeddings and tail-layer experts (~21% of parameters) still learn normally in the NVFP4 arm.",
+    "verdict": "PARTIALLY_SUPPORTED",
+    "reasoning": "They are not quantized and their step-300 changes are visible to the forward, but they are in the same bf16 dead zone as everything else: attention 0.80-1.26% of elements changed (BF16: 0.82-1.29%), router 0.39-2.41%, embeddings/lm_head 0.14%, RMSNorm 0%. The NVFP4 arm has 4-15% fewer changed elements than BF16 in every class and 20-40% smaller Adam moments, consistent with its weaker gradient signal (grad norm 0.12 vs 0.17; ~30% vs ~50% informative groups). So: same channel as BF16, slightly weaker, not 'normal' learning."
+   }
+  ],
+  "caveats": "1. Sampling: bitwise comparison covered experts 0-31 of layers 0,12,24,36,39 (quantized) and 44 (bf16 tail), attention wq (full) / wo (one 1024x2048 shard), router (64 rows), attention_norm, tok_embeddings/lm_head (first 37984 rows), norm.weight; fp4 code comparison used experts 0-7 of each sampled tensor. Fractions were extrapolated to the parameter classes by multiplying by class sizes. 2. The numpy quantizer reimplements the PyTorch reference body of four_over_six_quantize (the CuTe DSL fast path is claimed bitwise identical in the source, four_over_six.py L218-224); E2M1/E4M3/bf16 RNE were unit-checked but not validated against the GPU kernels (no torch on the host). Candidate-selection tie behaviour near fp32 rounding boundaries may differ negligibly. 3. The '-0.0 vs +0.0' artifact affects only the fp4_frac_deq_bf16_changed column of compare_ckpt_results.json (the codes/scales columns and the recomputed 'numerically different deq = 8' are correct). 4. I verified the code path and env knob for the generator's fused bf16-out GEMM but could not observe which branch (_grouped_mm_fp32_out_supported probe) ran at runtime; both containers use the same image and env so the branch should match. 5. Nothing here shows that the BF16 arm's reward climb is causally produced by its tiny-element updates; that question (and prompt/seed effects) is outside this angle. 6. The step-300 checkpoints are 'parked' copies; the BF16 run's step-300 was banked in window 5 (job 2063584) and the NVFP4 run's in window 10 (job 2067100) \u2014 same optimizer steps, different wall-clock. 7. The 'dead zone' analysis assumes |Adam update| <= lr; transient bias-correction excursions could allow slightly larger steps, consistent with the observed max changed |w_init| = 2^-11 (half-ulp 1.9e-6) rather than 2^-12. 8. The task's stated repo path agent_scratch/nvfp4_4over6/repos/titan-nvfp4 does not exist; the checkouts actually mounted are /home/scratch.hanlinb_ent_1/repos/titan-nvfp4 (branch nvfp4-4over6-refactor, HEAD a24a9e08e) and /home/scratch.hanlinb_ent_1/repos/ao-nvfp4 (branch nvfp4-4over6-refactor, HEAD 1f95131e8), per run_4x4_fastnic.sh L22-23 (/scratch = /home/scratch.hanlinb_ent_1).",
+  "artifacts": [
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/compare_ckpt_results.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/compare_ckpt.log",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/compare_ckpt.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/drift_sim_results.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/drift_sim.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/fo6_np.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/dcp_read.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/dcp_meta2.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/hf_read.py",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/tf_aux.json",
+   "/tmp/claude-147915/-home-hanlinb/87c5c385-2451-4aa9-92a6-6e561d466781/scratchpad/analysis_codetrace_deadzone/tf_aux.py"
+  ]
+ }
+]

@@ -1,0 +1,31 @@
+tag,bf16_201-300,nvfp4_201-300,ratio_nvfp4_over_bf16,bf16_b1->b2->b3,nvfp4_b1->b2->b3,classification,note
+advantage/_min,-1.7233343908190728,-0.8832301008701324,0.5125123165738876,-1.093->-1.316->-1.723,-0.7262->-0.9253->-0.8832,CONSEQUENCE,"same mechanism as advantage/_std (most-negative advantage occurs in groups with 1 wrong of many right, which NVFP4 rarely produces)"
+advantage/_std,0.7017007386684417,0.5188892251253128,0.7394736766416479,0.5822->0.6735->0.7017,0.4983->0.5058->0.5189,CONSEQUENCE,std-normalised advantages are 0 on zero-std groups; fewer signal groups -> lower batch advantage std
+bit_wise/logprob_diff/max,1.1164092254638671,3.8722074115276337,3.468448059374227,1.045->1.235->1.116,3.586->3.71->3.872,"CANDIDATE CAUSE (present from step 1, flat)","per-step worst token 3.7 vs 1.1 nats; peaks 36.0 (step 249), 15.1 (202); uncorrelated with reward (r=-0.005..0.04)"
+bit_wise/logprob_diff/mean,-0.0006835716913337819,-0.0029138003406114876,4.262611189948627,-0.0006802->-0.0006647->-0.0006836,-0.00292->-0.002898->-0.002914,"CANDIDATE CAUSE (present from step 1, flat)",trainer-vs-generator k1 KL estimate -0.0029 vs -0.0007 nats/token; slope ~0 in both runs; NOT correlated with per-step reward within NVFP4 (r=-0.005)
+generator/decode_time_ms/max,357442.695,587776.080625,1.6443924826187872,3.579e+05->3.755e+05->3.574e+05,5.505e+05->5.479e+05->5.878e+05,UNRELATED (perf),
+generator/decode_time_ms/mean,250653.7628125,407852.6146875,1.627155364081215,2.48e+05->2.583e+05->2.507e+05,3.781e+05->3.73e+05->4.079e+05,UNRELATED to reward (perf),NVFP4 rollout kernels 1.63x slower; same tokens generated
+generator/inter_token_latency_ms/max,179.67007995605468,297.06094284057616,1.6533690134341454,179.3->187.7->179.7,274.4->272.9->297.1,UNRELATED (perf),
+generator/inter_token_latency_ms/mean,174.6847917175293,287.2077090454102,1.6441483326713062,174.9->183.2->174.7,269.2->267.8->287.2,UNRELATED (perf),1.64x
+generator/prefill_time_ms/max,445.8976861572266,733.6380615234375,1.6453058275452717,518.4->541.6->445.9,802.1->810.7->733.6,UNRELATED (perf),
+generator/prefill_time_ms/mean,437.7721258544922,665.9186108398437,1.5211535214582927,381.1->517.4->437.8,727.8->798.7->665.9,UNRELATED (perf),1.52x
+generator/queue_time_ms/max,5.346088380813598,4.2187979531288144,0.7891373379215952,2.023->8.258->5.346,7.243->11.6->4.219,"UNRELATED (perf, ms-scale noise)",
+generator/queue_time_ms/mean,2.7771620082855226,2.077379125356674,0.7480223044816681,0.8893->3.344->2.777,2.444->4.401->2.077,"UNRELATED (perf, ms-scale noise)",
+generator/time_to_first_token_ms/max,449.3102590942383,737.4566430664063,1.641308267817077,521.1->544.7->449.3,806.7->815.3->737.5,UNRELATED (perf),
+generator/time_to_first_token_ms/mean,443.1687359619141,670.0266171264649,1.5118995604961785,382.8->523.1->443.2,732.2->805.9->670,UNRELATED (perf),
+loss/mean,0.019243302315007895,0.007047765736933798,0.3662451289058235,0.007098->0.01318->0.01924,0.008944->0.005159->0.007048,CONSEQUENCE,sum of -ratio*adv over tokens; scales with number of signal groups and reward variance
+loss/ratio_clipped_frac,0.0031953850155696274,0.02051726237870753,6.420904610473053,0.003371->0.003312->0.003195,0.02071->0.02048->0.02052,"CANDIDATE CAUSE (present from step 1, flat)","6.4x BF16; policy_age=0 so ALL clipping is trainer/generator numerical mismatch, not staleness; 2.05% of tokens get zero gradient"
+perf/trainer/step_time_ratio/blocking_generator_pull_model_state_dict,3.0283751613069396e-08,1.7210692098146295e-08,0.5683143990230975,2.151e-08->2.126e-08->3.028e-08,1.59e-08->1.428e-08->1.721e-08,"UNRELATED (1e-8 ratios, timing noise)",
+perf/trainer/step_time_ratio/blocking_trainer_push_model_state_dict,4.824475730913491e-08,2.8825770641560667e-08,0.5974902196492684,3.27e-08->3.686e-08->4.824e-08,2.574e-08->2.236e-08->2.883e-08,"UNRELATED (1e-8 ratios, timing noise)",
+perf/trainer/step_time_ratio/unaccounted,2.5378294026268122e-06,1.6391294229833876e-06,0.6458784902116691,2.284e-06->2.435e-06->2.538e-06,1.675e-06->1.566e-06->1.639e-06,"UNRELATED (1e-6 ratios, timing noise)",
+perf/trainer/tokens_per_second_full_step,237.40008026123047,142.35947120666503,0.5996605858347454,227.5->221.4->237.4,149.6->150.6->142.4,UNRELATED (perf),
+perf/trainer/tokens_per_second_fwd_bwd,4020.55119140625,2405.315440673828,0.5982551461638104,4165->4134->4021,2466->2514->2405,UNRELATED (perf),
+rollout_reward/_mean,0.251875,0.0921875,0.36600496277915634,0.1217->0.1848->0.2519,0.07734->0.09375->0.09219,CONSEQUENCE/OUTCOME,"the target quantity; NVFP4 below BF16 from steps 1-20 (0.059 vs 0.091) and flat (slope +0.0076/100 steps, t=1.8) vs BF16 +0.063/100 (t=9.7)"
+rollout_reward/_std,0.4102677057683468,0.26231995835900307,0.6393872943709569,0.3028->0.3676->0.4103,0.2405->0.2615->0.2623,CONSEQUENCE,"binary reward: std = sqrt(p(1-p)), follows mean"
+rollout_reward/_sum,16.12,5.9,0.36600496277915634,7.79->11.83->16.12,4.95->6->5.9,CONSEQUENCE,"= 64*mean, identical information"
+rollout_reward/component/RewardMathVerify/mean,0.251875,0.0921875,0.36600496277915634,0.1217->0.1848->0.2519,0.07734->0.09375->0.09219,CONSEQUENCE,identical to _mean (single reward component)
+rollout_reward/group_zero_std_frac/mean,0.4925,0.6975,1.4162436548223352,0.6325->0.5275->0.4925,0.7163->0.7075->0.6975,MECHANISM (amplifier) + CONSEQUENCE,0.70 vs 0.49 in 201-300: NVFP4 trains on 2.4 signal groups/step vs 4.1; itself a function of per-prompt solve rate; 18 NVFP4 steps had zero signal groups (grad_norm=0) vs 2 for BF16
+timing/step/forward_backward/mean,23.06066032409668,38.16913652420044,1.6551623408769662,21.95->21.99->23.06,36.82->35.89->38.17,UNRELATED (perf),38 vs 23 s
+timing/step/total/mean,387.52315002441406,642.4072802734376,1.6577262035389775,399->408.4->387.5,601.6->592.7->642.4,UNRELATED (perf),642 vs 388 s; 94% of it is wait_for_training_batch = rollout generation
+timing/step/wait_for_training_batch/mean,364.371887512207,604.1397631835938,1.65803066561592,376.9->386.4->364.4,564.6->556.7->604.1,UNRELATED (perf),604 vs 364 s
+trainer/grad_norm/mean,0.16935791015625,0.11987548828125,0.7078233793192924,0.1379->0.1614->0.1694,0.1117->0.1145->0.1199,CONSEQUENCE,"r(grad_norm, zero_std)=-0.84/-0.86 within run: grad norm is set by how many groups carry signal"

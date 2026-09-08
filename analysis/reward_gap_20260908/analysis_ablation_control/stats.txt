@@ -1,0 +1,59 @@
+### prompt_length/mean steps 1-10 identical to arm_bf16?
+arm_bf16                         identical steps: 10/10
+arm_bf16_4x4_long                identical steps: 10/10
+arm_nvfp4_deq                    identical steps: 10/10
+arm_nvfp4_deq_4x4                identical steps: 10/10
+arm_nvfp4_deq_4x4_100            identical steps: 10/10
+arm_nvfp4_deq_4x4_long           identical steps: 10/10
+arm_nvfp4_hp                     identical steps: 10/10
+arm_mxfp8_deq                    identical steps: 10/10
+arm_mxfp8_e2e                    identical steps: 10/10
+arm_mxfp8_hp                     identical steps: 10/10
+arm_nvfp4_deq_cache_smoke        identical steps: 3/3
+
+### step-1 reward (policy version 0 = untouched HF weights; rollout precision is the ONLY difference), counts of 64
+arm_bf16                         0.0938 = 6/64
+arm_bf16_4x4_long                0.0781 = 5/64
+arm_nvfp4_deq                    0.0312 = 2/64
+arm_nvfp4_deq_4x4                0.0625 = 4/64
+arm_nvfp4_deq_4x4_100            0.0469 = 3/64
+arm_nvfp4_deq_4x4_long           0.0312 = 2/64
+arm_nvfp4_hp                     0.0781 = 5/64
+arm_mxfp8_deq                    0.0156 = 1/64
+arm_mxfp8_e2e                    0.0312 = 2/64
+arm_mxfp8_hp                     0.0781 = 5/64
+arm_nvfp4_deq_cache_smoke        0.0938 = 6/64
+pooled step-1: BF16 11/128 = 0.0859; NVFP4-deq 11/256 = 0.0430; one-sided Fisher p = 0.073
+
+### steps 1-10 mean reward per run (all on identical prompts)
+arm_bf16                         0.0984
+arm_mxfp8_hp                     0.0828
+arm_bf16_4x4_long                0.0813
+arm_mxfp8_deq                    0.0750
+arm_nvfp4_hp                     0.0734
+arm_mxfp8_e2e                    0.0734
+arm_nvfp4_deq_4x4                0.0703
+arm_nvfp4_deq_4x4_long           0.0672
+arm_nvfp4_deq                    0.0641
+arm_nvfp4_deq_4x4_100            0.0578
+BF16 replicates mean 0.0898 (min 0.0813); NVFP4-deq replicates mean 0.0648 (max 0.0703); ratio 0.72
+all 4 NVFP4-deq below both BF16: True; P under exchangeability of 2 BF16 ranking top-2 of 6 = 0.067
+all 8 low-precision arms/replicates below both BF16: False; P(2 BF16 rank top-2 of 10) = 0.0222
+
+### paired sign counts steps 1-10 (BF16 - NVFP4deq)
+arm_bf16 vs arm_nvfp4_deq: + 8  0 1  - 1  mean +0.0344
+arm_bf16 vs arm_nvfp4_deq_4x4_long: + 7  0 1  - 2  mean +0.0312
+arm_bf16_4x4_long vs arm_nvfp4_deq: + 8  0 0  - 2  mean +0.0172
+arm_bf16_4x4_long vs arm_nvfp4_deq_4x4_long: + 7  0 1  - 2  mean +0.0141
+
+### per-step reward across replicates (prompt-difficulty signature)
+step  1: BF16 ['0.094', '0.078']  NVFP4deq ['0.031', '0.062', '0.047', '0.031']
+step  2: BF16 ['0.047', '0.047']  NVFP4deq ['0.031', '0.047', '0.031', '0.016']
+step  3: BF16 ['0.016', '0.016']  NVFP4deq ['0.000', '0.016', '0.016', '0.000']
+step  4: BF16 ['0.188', '0.094']  NVFP4deq ['0.078', '0.094', '0.016', '0.078']
+step  5: BF16 ['0.125', '0.109']  NVFP4deq ['0.078', '0.094', '0.125', '0.047']
+step  6: BF16 ['0.125', '0.172']  NVFP4deq ['0.156', '0.172', '0.109', '0.156']
+step  7: BF16 ['0.062', '0.000']  NVFP4deq ['0.016', '0.031', '0.031', '0.047']
+step  8: BF16 ['0.125', '0.109']  NVFP4deq ['0.062', '0.109', '0.047', '0.125']
+step  9: BF16 ['0.031', '0.047']  NVFP4deq ['0.031', '0.016', '0.000', '0.047']
+step 10: BF16 ['0.172', '0.141']  NVFP4deq ['0.156', '0.062', '0.156', '0.125']

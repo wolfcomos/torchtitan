@@ -1,0 +1,179 @@
+BF16: canonical pvs=312 min=0 max=311; pvs with multiple blocks=19; pvs with no complete block=[312]
+NVFP4: canonical pvs=313 min=0 max=312; pvs with multiple blocks=49; pvs with no complete block=[313]
+  BF16 offset step=pv+0: n=300 reward mean-abs-diff=0.11281 max=0.42188; zero-std mean-abs-diff=0.19292 max=0.75000
+  BF16 offset step=pv+1: n=300 reward mean-abs-diff=0.00000 max=0.00000; zero-std mean-abs-diff=0.00000 max=0.00000
+  BF16 offset step=pv+-1: n=300 reward mean-abs-diff=0.10724 max=0.40625; zero-std mean-abs-diff=0.19917 max=0.62500
+  NVFP4 offset step=pv+0: n=300 reward mean-abs-diff=0.07510 max=0.25000; zero-std mean-abs-diff=0.18042 max=0.62500
+  NVFP4 offset step=pv+1: n=300 reward mean-abs-diff=0.00000 max=0.00000; zero-std mean-abs-diff=0.00000 max=0.00000
+  NVFP4 offset step=pv+-1: n=300 reward mean-abs-diff=0.06719 max=0.26562; zero-std mean-abs-diff=0.18125 max=0.75000
+paired rows: 2400 steps: 300 step range 1 300
+
+=== (1) paired accuracy by block (reward = k/8 on the SAME prompts) ===
+    block nprompts    BF16   NVFP4    diff           boot95CI   sign +/-   sign p           wilcoxon n,z,p
+   1-50        400  0.1147  0.0762 -0.0384 [-0.0519,-0.0256]   33/104  9.31e-10    137   -5.36 8.25e-08
+  51-100       400  0.1288  0.0784 -0.0503 [-0.0656,-0.0353]   45/117  1.42e-08    162   -6.38 1.79e-10
+ 101-150       400  0.1684  0.0919 -0.0766 [-0.0934,-0.0603]   31/150  6.34e-20    181   -8.42 3.89e-17
+ 151-200       400  0.2013  0.0956 -0.1056 [-0.1253,-0.0859]   27/157  1.71e-23    184   -9.59 8.69e-22
+ 201-250       400  0.2303  0.0859 -0.1444 [-0.1672,-0.1219]   18/185  4.24e-36    203  -11.18 4.95e-29
+ 251-300       400  0.2734  0.0984 -0.1750 [-0.2000,-0.1512]   20/205  7.82e-40    225  -12.10 1.08e-33
+   1-10         80  0.0813  0.0672 -0.0141 [-0.0344,+0.0078]    7/17   6.39e-02     24   -1.39 1.66e-01
+   1-30        240  0.1130  0.0745 -0.0385 [-0.0552,-0.0224]   19/68   1.24e-07     87   -4.19 2.76e-05
+   1-300      2400  0.1861  0.0878 -0.0984 [-0.1065,-0.0905]  174/918  1.51e-122   1092  -22.55 1.33e-112
+
+=== (2) discordance: BF16>=1 correct & NVFP4=0  vs  NVFP4>=1 & BF16=0 ; both>=1 ; both=0 ===
+    block     n   B>0&N=0   N>0&B=0   both>0   both=0  | among both>0: B>N   N>B   tie
+   1-50     400    56 14%    21  5%   90 22%  233 58% |                 48    12    30
+  51-100    400    63 16%    28  7%   89 22%  220 55% |                 54    17    18
+ 101-150    400    94 24%    16  4%  105 26%  185 46% |                 56    15    34
+ 151-200    400    90 22%    12  3%  104 26%  194 48% |                 67    15    22
+ 201-250    400   107 27%     8  2%  101 25%  184 46% |                 78    10    13
+ 251-300    400   106 26%    10  2%  127 32%  157 39% |                 99    10    18
+   1-10      80    10 12%     6  8%   14 18%   50 62% |                  7     1     6
+   1-30     240    38 16%    12  5%   53 22%  137 57% |                 30     7    16
+   1-300   2400   516 22%    95  4%  616 26% 1173 49% |                402    79   135
+
+=== (3) earliest steps: per-step paired reward (steps 1-30) ===
+ step   1: BF16  5/64=0.078  NVFP4  2/64=0.031  diff  -3   per-prompt k pairs (B,N): [(0, 0), (0, 0), (1, 0), (4, 2), (0, 0), (0, 0), (0, 0), (0, 0)]
+ step   2: BF16  3/64=0.047  NVFP4  1/64=0.016  diff  -2   per-prompt k pairs (B,N): [(0, 0), (1, 0), (0, 0), (0, 0), (2, 1), (0, 0), (0, 0), (0, 0)]
+ step   3: BF16  1/64=0.016  NVFP4  0/64=0.000  diff  -1   per-prompt k pairs (B,N): [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]
+ step   4: BF16  6/64=0.094  NVFP4  5/64=0.078  diff  -1   per-prompt k pairs (B,N): [(2, 1), (0, 0), (3, 3), (0, 0), (0, 0), (1, 1), (0, 0), (0, 0)]
+ step   5: BF16  7/64=0.109  NVFP4  3/64=0.047  diff  -4   per-prompt k pairs (B,N): [(1, 0), (1, 0), (0, 0), (0, 0), (0, 0), (5, 3), (0, 0), (0, 0)]
+ step   6: BF16 11/64=0.172  NVFP4 10/64=0.156  diff  -1   per-prompt k pairs (B,N): [(0, 1), (1, 0), (2, 2), (0, 0), (1, 0), (2, 2), (5, 5), (0, 0)]
+ step   7: BF16  0/64=0.000  NVFP4  3/64=0.047  diff  +3   per-prompt k pairs (B,N): [(0, 2), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 1), (0, 0)]
+ step   8: BF16  7/64=0.109  NVFP4  8/64=0.125  diff  +1   per-prompt k pairs (B,N): [(1, 0), (1, 0), (0, 1), (0, 0), (2, 5), (0, 0), (3, 2), (0, 0)]
+ step   9: BF16  3/64=0.047  NVFP4  3/64=0.047  diff  +0   per-prompt k pairs (B,N): [(0, 0), (1, 0), (0, 1), (2, 2), (0, 0), (0, 0), (0, 0), (0, 0)]
+ step  10: BF16  9/64=0.141  NVFP4  8/64=0.125  diff  -1   per-prompt k pairs (B,N): [(0, 0), (0, 0), (3, 2), (0, 0), (0, 0), (6, 4), (0, 2), (0, 0)]
+ step  11: BF16  3/64=0.047  NVFP4  0/64=0.000  diff  -3   per-prompt k pairs (B,N): [(0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (1, 0), (1, 0), (1, 0)]
+ step  12: BF16 14/64=0.219  NVFP4  6/64=0.094  diff  -8   per-prompt k pairs (B,N): [(0, 0), (0, 0), (5, 0), (1, 3), (7, 3), (1, 0), (0, 0), (0, 0)]
+ step  13: BF16  3/64=0.047  NVFP4  2/64=0.031  diff  -1   per-prompt k pairs (B,N): [(1, 1), (0, 0), (0, 0), (2, 1), (0, 0), (0, 0), (0, 0), (0, 0)]
+ step  14: BF16 10/64=0.156  NVFP4  3/64=0.047  diff  -7   per-prompt k pairs (B,N): [(0, 0), (0, 0), (4, 1), (0, 0), (2, 1), (2, 0), (0, 0), (2, 1)]
+ step  15: BF16  3/64=0.047  NVFP4  2/64=0.031  diff  -1   per-prompt k pairs (B,N): [(0, 0), (0, 0), (0, 0), (0, 1), (0, 0), (0, 0), (0, 0), (3, 1)]
+ step  16: BF16 10/64=0.156  NVFP4  8/64=0.125  diff  -2   per-prompt k pairs (B,N): [(0, 0), (1, 0), (0, 0), (4, 3), (2, 4), (0, 0), (0, 0), (3, 1)]
+ step  17: BF16  3/64=0.047  NVFP4  1/64=0.016  diff  -2   per-prompt k pairs (B,N): [(3, 1), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0)]
+ step  18: BF16  7/64=0.109  NVFP4  3/64=0.047  diff  -4   per-prompt k pairs (B,N): [(2, 0), (2, 1), (0, 0), (0, 0), (0, 0), (0, 1), (1, 0), (2, 1)]
+ step  19: BF16  6/64=0.094  NVFP4  5/64=0.078  diff  -1   per-prompt k pairs (B,N): [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0), (5, 5), (0, 0), (0, 0)]
+ step  20: BF16  6/64=0.094  NVFP4  3/64=0.047  diff  -3   per-prompt k pairs (B,N): [(1, 0), (0, 0), (0, 0), (0, 0), (1, 0), (4, 3), (0, 0), (0, 0)]
+ step  21: BF16 11/64=0.172  NVFP4  7/64=0.109  diff  -4   per-prompt k pairs (B,N): [(0, 0), (3, 3), (0, 0), (0, 0), (0, 0), (5, 3), (0, 0), (3, 1)]
+ step  22: BF16  8/64=0.125  NVFP4  8/64=0.125  diff  +0   per-prompt k pairs (B,N): [(0, 0), (0, 0), (4, 4), (0, 0), (2, 0), (0, 0), (2, 4), (0, 0)]
+ step  23: BF16 11/64=0.172  NVFP4  5/64=0.078  diff  -6   per-prompt k pairs (B,N): [(4, 0), (0, 0), (4, 1), (0, 0), (2, 1), (0, 0), (1, 0), (0, 3)]
+ step  24: BF16  5/64=0.078  NVFP4  7/64=0.109  diff  +2   per-prompt k pairs (B,N): [(0, 0), (1, 3), (0, 0), (1, 1), (1, 3), (1, 0), (0, 0), (1, 0)]
+ step  25: BF16 14/64=0.219  NVFP4 10/64=0.156  diff  -4   per-prompt k pairs (B,N): [(3, 2), (1, 0), (0, 2), (3, 0), (2, 3), (4, 3), (0, 0), (1, 0)]
+ step  26: BF16  4/64=0.062  NVFP4  6/64=0.094  diff  +2   per-prompt k pairs (B,N): [(0, 2), (0, 0), (0, 0), (0, 0), (0, 0), (2, 2), (0, 0), (2, 2)]
+ step  27: BF16 20/64=0.312  NVFP4  7/64=0.109  diff -13   per-prompt k pairs (B,N): [(1, 1), (3, 0), (1, 0), (2, 1), (0, 0), (2, 0), (7, 5), (4, 0)]
+ step  28: BF16  5/64=0.078  NVFP4  3/64=0.047  diff  -2   per-prompt k pairs (B,N): [(0, 0), (0, 0), (0, 0), (0, 0), (5, 3), (0, 0), (0, 0), (0, 0)]
+ step  29: BF16 15/64=0.234  NVFP4 13/64=0.203  diff  -2   per-prompt k pairs (B,N): [(0, 1), (0, 0), (0, 0), (4, 4), (7, 5), (0, 0), (3, 3), (1, 0)]
+ step  30: BF16  7/64=0.109  NVFP4  1/64=0.016  diff  -6   per-prompt k pairs (B,N): [(0, 0), (1, 0), (0, 0), (2, 1), (1, 0), (0, 0), (3, 0), (0, 0)]
+ steps 1-5: BF16 22/320=0.0688 NVFP4 11/320=0.0344 diff -0.0344 CI[-0.0563,-0.0156] sign +0/-9 p=0.004
+ steps 1-10: BF16 52/640=0.0813 NVFP4 43/640=0.0672 diff -0.0141 CI[-0.0344,+0.0078] sign +7/-17 p=0.064
+ steps 11-20: BF16 65/640=0.1016 NVFP4 33/640=0.0516 diff -0.0500 CI[-0.0797,-0.0234] sign +4/-24 p=0.000
+ steps 21-30: BF16 100/640=0.1562 NVFP4 67/640=0.1047 diff -0.0516 CI[-0.0859,-0.0187] sign +8/-27 p=0.002
+ steps 1-30: BF16 217/1920=0.1130 NVFP4 143/1920=0.0745 diff -0.0385 CI[-0.0552,-0.0224] sign +19/-68 p=0.000
+
+=== (5) per-group correct-count histogram (k/8) per block ===
+    block   run k=0 k=1 k=2 k=3 k=4 k=5 k=6 k=7 k=8   zero_std=(k0+k8)/n  k0frac  k8frac
+   1-50    BF16 254  52  38  26  11   9   1   6   3   0.642   0.635  0.007
+   1-50   NVFP4 289  52  19  20  10   8   1   0   1   0.725   0.723  0.003
+  51-100   BF16 248  55  29  23  18  11  10   5   1   0.623   0.620  0.003
+  51-100  NVFP4 283  53  25  19  11   7   2   0   0   0.708   0.708  0.000
+ 101-150   BF16 201  72  42  31  19  11  14   5   5   0.515   0.502  0.013
+ 101-150  NVFP4 279  48  26  19  13   9   3   2   1   0.700   0.698  0.003
+ 151-200   BF16 206  44  43  27  25  28   6  11  10   0.540   0.515  0.025
+ 151-200  NVFP4 284  46  22  15  13   8   7   3   2   0.715   0.710  0.005
+ 201-250   BF16 192  51  42  24  20  19  21  19  12   0.510   0.480  0.030
+ 201-250  NVFP4 291  45  21  15  13   5   6   2   2   0.733   0.728  0.005
+ 251-300   BF16 167  51  41  36  21  22  17  22  23   0.475   0.417  0.058
+ 251-300  NVFP4 263  55  38  17  16   3   4   2   2   0.662   0.657  0.005
+   1-300   BF16 1268 325 235 167 114 100  69  68  54   0.551   0.528  0.022
+   1-300  NVFP4 1689 299 151 105  76  40  23   9   8   0.707   0.704  0.003
+
+=== (6) policy-version staleness ===
+ BF16: tfevents rollout/max_policy_version/max - step: [(-1, 300)]; max-min pv: [(0, 300)]; trainer/policy_version - step: [(0, 300)]
+        train_batch/policy_age/mean: distinct=[(0.0, 300)]  policy_age_max: [(0.0, 300)]
+        jsonl: records with min_policy_version!=max_policy_version: 0/5260
+ NVFP4: tfevents rollout/max_policy_version/max - step: [(-1, 300)]; max-min pv: [(0, 300)]; trainer/policy_version - step: [(0, 300)]
+        train_batch/policy_age/mean: distinct=[(0.0, 300)]  policy_age_max: [(0.0, 300)]
+        jsonl: records with min_policy_version!=max_policy_version: 0/5784
+
+=== (4) failure modes (reward-0 recorded samples; each group logs its min- and max-reward sample) ===
+-- block 1-50
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=112 modes={'wrong_well_formed': 77, 'truncated@limit': 33, 'completed_no_final_answer': 1, 'truncated@limit+repetitive': 1}
+     truncated=30.36% dup12>0.3=0.89% dup12>0.1=5.36% median dup12=0.000 median compress_ratio=0.354 median nchar=3329
+  BF16 reward-0 (min) sample on those SAME prompts: n=56 modes={'wrong_well_formed': 39, 'truncated@limit': 15, 'completed_no_final_answer': 2}
+     truncated=26.79% dup12>0.3=0.00% dup12>0.1=7.14% median dup12=0.004 median compress_ratio=0.354 median nchar=3525
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=42 modes={'wrong_well_formed': 33, 'truncated@limit': 9}
+     truncated=21.43% dup12>0.3=0.00% dup12>0.1=2.38% median dup12=0.002 median compress_ratio=0.358 median nchar=3100
+  ALL NVFP4 reward-0 recorded samples: n=688 modes={'wrong_well_formed': 415, 'truncated@limit': 259, 'completed_no_final_answer': 12, 'truncated@limit+repetitive': 2}
+     truncated=37.94% dup12>0.3=0.29% dup12>0.1=3.92% median dup12=0.002 median compress_ratio=0.350 median nchar=3738
+  ALL BF16 reward-0 recorded samples: n=651 modes={'wrong_well_formed': 396, 'truncated@limit': 247, 'completed_no_final_answer': 7, 'truncated@limit+repetitive': 1}
+     truncated=38.10% dup12>0.3=0.15% dup12>0.1=2.61% median dup12=0.003 median compress_ratio=0.348 median nchar=3756
+-- block 51-100
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=126 modes={'wrong_well_formed': 91, 'truncated@limit': 32, 'completed_no_final_answer': 3}
+     truncated=25.40% dup12>0.3=0.00% dup12>0.1=3.97% median dup12=0.000 median compress_ratio=0.345 median nchar=3522
+  BF16 reward-0 (min) sample on those SAME prompts: n=63 modes={'wrong_well_formed': 40, 'truncated@limit': 19, 'completed_no_final_answer': 3, 'truncated@limit+repetitive': 1}
+     truncated=31.75% dup12>0.3=1.59% dup12>0.1=4.76% median dup12=0.008 median compress_ratio=0.351 median nchar=3594
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=56 modes={'wrong_well_formed': 33, 'truncated@limit': 23}
+     truncated=41.07% dup12>0.3=0.00% dup12>0.1=1.79% median dup12=0.003 median compress_ratio=0.340 median nchar=4150
+  ALL NVFP4 reward-0 recorded samples: n=683 modes={'wrong_well_formed': 434, 'truncated@limit': 238, 'completed_no_final_answer': 9, 'truncated@limit+repetitive': 2}
+     truncated=35.14% dup12>0.3=0.44% dup12>0.1=5.12% median dup12=0.004 median compress_ratio=0.349 median nchar=3600
+  ALL BF16 reward-0 recorded samples: n=647 modes={'wrong_well_formed': 394, 'truncated@limit': 244, 'completed_no_final_answer': 5, 'truncated@limit+repetitive': 4}
+     truncated=38.33% dup12>0.3=0.77% dup12>0.1=3.09% median dup12=0.004 median compress_ratio=0.346 median nchar=3881
+-- block 101-150
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=188 modes={'wrong_well_formed': 136, 'truncated@limit': 45, 'completed_no_final_answer': 7}
+     truncated=23.94% dup12>0.3=0.00% dup12>0.1=2.66% median dup12=0.002 median compress_ratio=0.350 median nchar=3422
+  BF16 reward-0 (min) sample on those SAME prompts: n=94 modes={'wrong_well_formed': 68, 'truncated@limit': 26}
+     truncated=27.66% dup12>0.3=0.00% dup12>0.1=2.13% median dup12=0.000 median compress_ratio=0.355 median nchar=3322
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=32 modes={'wrong_well_formed': 21, 'truncated@limit': 10, 'completed_no_final_answer': 1}
+     truncated=31.25% dup12>0.3=0.00% dup12>0.1=0.00% median dup12=0.000 median compress_ratio=0.342 median nchar=3436
+  ALL NVFP4 reward-0 recorded samples: n=678 modes={'wrong_well_formed': 421, 'truncated@limit': 240, 'completed_no_final_answer': 16, 'truncated@limit+repetitive': 1}
+     truncated=35.55% dup12>0.3=0.29% dup12>0.1=3.69% median dup12=0.002 median compress_ratio=0.345 median nchar=3805
+  ALL BF16 reward-0 recorded samples: n=596 modes={'wrong_well_formed': 362, 'truncated@limit': 224, 'completed_no_final_answer': 9, 'truncated@limit+repetitive': 1}
+     truncated=37.75% dup12>0.3=0.17% dup12>0.1=2.35% median dup12=0.002 median compress_ratio=0.346 median nchar=3900
+-- block 151-200
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=180 modes={'wrong_well_formed': 127, 'truncated@limit': 49, 'completed_no_final_answer': 2, 'truncated@limit+repetitive': 2}
+     truncated=28.33% dup12>0.3=1.11% dup12>0.1=2.22% median dup12=0.000 median compress_ratio=0.355 median nchar=3548
+  BF16 reward-0 (min) sample on those SAME prompts: n=90 modes={'wrong_well_formed': 64, 'truncated@limit': 25, 'completed_no_final_answer': 1}
+     truncated=27.78% dup12>0.3=0.00% dup12>0.1=0.00% median dup12=0.000 median compress_ratio=0.356 median nchar=3502
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=24 modes={'truncated@limit': 16, 'wrong_well_formed': 8}
+     truncated=66.67% dup12>0.3=0.00% dup12>0.1=0.00% median dup12=0.009 median compress_ratio=0.326 median nchar=4170
+  ALL NVFP4 reward-0 recorded samples: n=682 modes={'wrong_well_formed': 429, 'truncated@limit': 237, 'completed_no_final_answer': 11, 'truncated@limit+repetitive': 5}
+     truncated=35.48% dup12>0.3=0.73% dup12>0.1=3.52% median dup12=0.000 median compress_ratio=0.349 median nchar=3789
+  ALL BF16 reward-0 recorded samples: n=596 modes={'wrong_well_formed': 350, 'truncated@limit': 239, 'completed_no_final_answer': 7}
+     truncated=40.10% dup12>0.3=0.00% dup12>0.1=2.18% median dup12=0.002 median compress_ratio=0.345 median nchar=3873
+-- block 201-250
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=214 modes={'wrong_well_formed': 155, 'truncated@limit': 51, 'completed_no_final_answer': 6, 'truncated@limit+repetitive': 2}
+     truncated=24.77% dup12>0.3=0.93% dup12>0.1=3.27% median dup12=0.000 median compress_ratio=0.360 median nchar=3116
+  BF16 reward-0 (min) sample on those SAME prompts: n=107 modes={'wrong_well_formed': 75, 'truncated@limit': 30, 'completed_no_final_answer': 1, 'truncated@limit+repetitive': 1}
+     truncated=28.97% dup12>0.3=0.93% dup12>0.1=2.80% median dup12=0.000 median compress_ratio=0.363 median nchar=3362
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=16 modes={'wrong_well_formed': 9, 'truncated@limit': 7}
+     truncated=43.75% dup12>0.3=0.00% dup12>0.1=6.25% median dup12=0.018 median compress_ratio=0.323 median nchar=3866
+  ALL NVFP4 reward-0 recorded samples: n=689 modes={'wrong_well_formed': 421, 'truncated@limit': 256, 'completed_no_final_answer': 10, 'truncated@limit+repetitive': 2}
+     truncated=37.45% dup12>0.3=0.29% dup12>0.1=3.34% median dup12=0.002 median compress_ratio=0.347 median nchar=3855
+  ALL BF16 reward-0 recorded samples: n=580 modes={'wrong_well_formed': 325, 'truncated@limit': 247, 'completed_no_final_answer': 6, 'truncated@limit+repetitive': 2}
+     truncated=42.93% dup12>0.3=0.34% dup12>0.1=4.83% median dup12=0.003 median compress_ratio=0.343 median nchar=4024
+-- block 251-300
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=212 modes={'wrong_well_formed': 163, 'truncated@limit': 43, 'completed_no_final_answer': 6}
+     truncated=20.28% dup12>0.3=0.00% dup12>0.1=1.89% median dup12=0.000 median compress_ratio=0.366 median nchar=2835
+  BF16 reward-0 (min) sample on those SAME prompts: n=100 modes={'wrong_well_formed': 68, 'truncated@limit': 28, 'completed_no_final_answer': 4}
+     truncated=28.00% dup12>0.3=0.00% dup12>0.1=2.00% median dup12=0.000 median compress_ratio=0.356 median nchar=3034
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=20 modes={'wrong_well_formed': 10, 'truncated@limit': 9, 'completed_no_final_answer': 1}
+     truncated=45.00% dup12>0.3=0.00% dup12>0.1=0.00% median dup12=0.001 median compress_ratio=0.345 median nchar=4460
+  ALL NVFP4 reward-0 recorded samples: n=661 modes={'wrong_well_formed': 409, 'truncated@limit': 238, 'completed_no_final_answer': 14}
+     truncated=36.01% dup12>0.3=0.00% dup12>0.1=2.42% median dup12=0.003 median compress_ratio=0.348 median nchar=3835
+  ALL BF16 reward-0 recorded samples: n=544 modes={'wrong_well_formed': 289, 'truncated@limit': 243, 'completed_no_final_answer': 8, 'truncated@limit+repetitive': 4}
+     truncated=45.40% dup12>0.3=0.74% dup12>0.1=3.31% median dup12=0.004 median compress_ratio=0.343 median nchar=4170
+-- block 1-300
+  NVFP4 reward-0 samples on prompts BF16 solved (B>=1,N=0): n=1032 modes={'wrong_well_formed': 749, 'truncated@limit': 253, 'completed_no_final_answer': 25, 'truncated@limit+repetitive': 5}
+     truncated=25.00% dup12>0.3=0.48% dup12>0.1=3.00% median dup12=0.000 median compress_ratio=0.356 median nchar=3240
+  BF16 reward-0 (min) sample on those SAME prompts: n=510 modes={'wrong_well_formed': 354, 'truncated@limit': 143, 'completed_no_final_answer': 11, 'truncated@limit+repetitive': 2}
+     truncated=28.43% dup12>0.3=0.39% dup12>0.1=2.75% median dup12=0.000 median compress_ratio=0.355 median nchar=3333
+  BF16 reward-0 samples on prompts NVFP4 solved (N>=1,B=0): n=190 modes={'wrong_well_formed': 114, 'truncated@limit': 74, 'completed_no_final_answer': 2}
+     truncated=38.95% dup12>0.3=0.00% dup12>0.1=1.58% median dup12=0.003 median compress_ratio=0.340 median nchar=3929
+  ALL NVFP4 reward-0 recorded samples: n=4081 modes={'wrong_well_formed': 2529, 'truncated@limit': 1468, 'completed_no_final_answer': 72, 'truncated@limit+repetitive': 12}
+     truncated=36.27% dup12>0.3=0.34% dup12>0.1=3.68% median dup12=0.002 median compress_ratio=0.348 median nchar=3764
+  ALL BF16 reward-0 recorded samples: n=3614 modes={'wrong_well_formed': 2116, 'truncated@limit': 1444, 'completed_no_final_answer': 42, 'truncated@limit+repetitive': 12}
+     truncated=40.29% dup12>0.3=0.36% dup12>0.1=3.04% median dup12=0.003 median compress_ratio=0.345 median nchar=3934
+
+=== truncation rate from tfevents rollout/truncation_rate/mean by block ===
+  BF16 1-50:0.330 51-100:0.331 101-150:0.317 151-200:0.327 201-250:0.339 251-300:0.338 | resp_len 1420 1418 1400 1421 1439 1435
+  NVFP4 1-50:0.348 51-100:0.326 101-150:0.317 151-200:0.318 201-250:0.338 251-300:0.333 | resp_len 1415 1397 1389 1400 1420 1422
+saved 1032 excerpt records
