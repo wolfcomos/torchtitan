@@ -593,23 +593,22 @@ def test_nvfp4_grouped_experts_reject_an_unknown_recipe(field_name):
         config.build()
 
 
-def test_nvfp4_non_v1_recipes_reject_cutedsl():
-    """V1_REQUANT and V2 are Triton-only; the CuteDSL grouped kernels exist for V1
-    alone. Raise rather than silently downgrading the backend, which would leave the
-    run slower than requested with no indication why."""
+def test_nvfp4_non_v1_recipes_take_cutedsl():
+    """The backend is a knob on every recipe: torchao routes V1_REQUANT and V2
+    through kernel_preference too, so the module must carry the requested
+    backend rather than pin the non-v1 recipes to Triton."""
     pytest.importorskip("torchao")
     nvfp4_mod = _nvfp4_experts_or_skip()
     cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
-    config = cls.Config(
+    module = cls.Config(
         dim=256,
         hidden_dim=512,
         num_experts=2,
         kernel_preference="cutedsl",
         fc1_recipe="v1_requant",
         fc2_recipe="v2",
-    )
-    with pytest.raises(ValueError, match="only available for recipe 'v1'"):
-        config.build()
+    ).build()
+    assert module._kernel_preference is nvfp4_mod.KernelPreference.CUTEDSL
 
 
 def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch):
@@ -623,13 +622,16 @@ def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch)
     nvfp4_mod = _nvfp4_experts_or_skip()
 
     calls = []
+    prefs = []
 
     def v1_requant_stub(A, B, **kwargs):
         calls.append(("v1_requant", tuple(B.shape)))
+        prefs.append(kwargs["kernel_preference"])
         return torch.zeros(A.shape[0], B.shape[1])
 
     def v2_stub(A, B, **kwargs):
         calls.append(("v2", tuple(B.shape)))
+        prefs.append(kwargs["kernel_preference"])
         return torch.zeros(A.shape[0], B.shape[1])
 
     import torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm_v2 as v2_mod
@@ -659,6 +661,8 @@ def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch)
     # B_t -- so w1/w3 arrive as (E, hidden, dim) and w2 as (E, dim, hidden).
     assert calls[0][1] == (2, 256, 128) and calls[1][1] == (2, 256, 128)
     assert calls[2][1] == (2, 128, 256)
+    # The module's backend reaches every entry point, not only the V1 seam.
+    assert prefs == [nvfp4_mod.KernelPreference.TRITON] * 3
 
 
 def test_nvfp4_fc1_and_fc2_state_is_independent():
@@ -817,17 +821,19 @@ def test_nvfp4_linear_v1_recipes_have_no_dgrad_vector():
         assert getattr(module, "_dgrad_rht_sign_vector", None) is None
 
 
-def test_nvfp4_linear_v2_rejects_cutedsl():
-    """V2 is Triton-only. Downgrading silently would leave a run slower than asked
-    for, on a different SR stream, with nothing in the log to say so."""
+def test_nvfp4_linear_v2_takes_cutedsl():
+    """The backend is a knob on every recipe; torchao's V2 linear reads
+    kernel_preference from the module, so the choice must land there."""
     NVFP4Linear = _nvfp4_linear_cls()
-    with pytest.raises(ValueError, match="only available for recipe 'v1'"):
-        NVFP4Linear.Config(
-            in_features=512,
-            out_features=512,
-            recipe="v2",
-            kernel_preference="cutedsl",
-        ).build()
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    module = NVFP4Linear.Config(
+        in_features=512,
+        out_features=512,
+        recipe="v2",
+        kernel_preference="cutedsl",
+    ).build()
+    assert module.kernel_preference is KernelPreference.CUTEDSL
 
 
 def test_nvfp4_linear_v2_signs_resample_in_place():

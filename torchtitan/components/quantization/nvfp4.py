@@ -276,17 +276,6 @@ try:
                 use_fast_math=config.use_fast_math,
                 recipe=NVFP4Recipe(config.recipe),
             )
-            # V1_REQUANT and V2 are Triton-only; the CuteDSL kernels exist for V1
-            # alone. Raise rather than silently downgrade, matching the grouped
-            # converter.
-            if (
-                config.recipe != "v1"
-                and self.kernel_preference is KernelPreference.CUTEDSL
-            ):
-                raise ValueError(
-                    "kernel_preference='cutedsl' is only available for recipe 'v1'; "
-                    f"got recipe={config.recipe!r}. Use 'triton'."
-                )
             # TorchAO created the runtime buffers on the (meta) build device.
             # Re-register them as None so ``_distribute_states`` skips them and
             # ``_init_self_buffers`` materializes them on the real device, per
@@ -392,6 +381,7 @@ try:
                     wgrad_rht=self._rht_sign_vector,
                     dgrad_rht=self._dgrad_rht_sign_vector,
                     sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
                     use_fast_math=self.use_fast_math,
                 )
             if self.recipe is not NVFP4Recipe.V1:
@@ -401,6 +391,7 @@ try:
                     self.bias,
                     sign_vector=self.rht_sign_vector,
                     sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
                     use_fast_math=self.use_fast_math,
                 )
             return nvfp4_linear(
@@ -699,16 +690,6 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                     )
             self._fc1_recipe = config.fc1_recipe
             self._fc2_recipe = config.fc2_recipe
-            # V1_REQUANT and V2 are Triton-only for now; the CuteDSL grouped kernels
-            # exist for V1 alone. Raise rather than silently downgrade the backend.
-            if (
-                self._fc1_recipe != "v1" or self._fc2_recipe != "v1"
-            ) and self._kernel_preference is KernelPreference.CUTEDSL:
-                raise ValueError(
-                    "kernel_preference='cutedsl' is only available for recipe 'v1'; "
-                    f"got fc1_recipe={self._fc1_recipe!r}, "
-                    f"fc2_recipe={self._fc2_recipe!r}. Use 'triton'."
-                )
             # Same buffer protocol as NVFP4Linear.__init__: register the runtime
             # buffers as None so _distribute_states skips them and
             # _init_self_buffers materializes them per rank on the real device.
@@ -850,6 +831,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                     sr_seed=seed,
                     offs=offs,
                     pad_token_groups_for_grouped_mm=False,
+                    kernel_preference=self._kernel_preference,
                     use_fast_math=self._use_fast_math,
                 )
             return nvfp4_v2_grouped_mm(
@@ -860,6 +842,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 sr_seed=seed,
                 offs=offs,
                 pad_token_groups_for_grouped_mm=False,
+                kernel_preference=self._kernel_preference,
                 use_fast_math=self._use_fast_math,
             )
 
@@ -952,7 +935,6 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
 
         Defaults to "v1" so an unchanged config is unaffected by this option's
         existence. Design doc §17 recommends "v1_requant" here and "v2" for FC2.
-        Both non-v1 recipes require kernel_preference="triton".
         """
 
         fc2_recipe: Literal["v1", "v1_requant", "v2"] = "v1"

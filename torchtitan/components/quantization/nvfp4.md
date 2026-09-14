@@ -169,9 +169,9 @@ property of DSV3's dimensions rather than of the recipe. Attention stays MXFP8,
 
 #### V2 limitations
 
-- Triton only. The CuteDSL kernels exist for `v1` alone, and requesting
-  `kernel_preference="cutedsl"` with `v1_requant` or `v2` raises rather than
-  downgrading the backend.
+- `kernel_preference` selects the backend for every recipe. A V2 step is bitwise
+  identical on `triton` and `cutedsl`; the V1_REQUANT backward is not, because its
+  stochastic-rounding cast of `dy` draws a different Philox stream per backend.
 - Plain `torch.compile` works. CUDA graphs (`mode="reduce-overhead"`) do not: the
   grouped path allocates its offsets tensor inside the traced region.
 - Under pipeline parallelism the schedule drives its own microbatches internally,

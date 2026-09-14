@@ -182,7 +182,9 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
 
 
 def deepseek_v3_debugmodel_nvfp4(
-    recipe: str = "v1", fc2_recipe: str | None = None
+    recipe: str = "v1",
+    fc2_recipe: str | None = None,
+    kernel_preference: str | None = None,
 ) -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     assert config.model_spec is not None
@@ -204,9 +206,7 @@ def deepseek_v3_debugmodel_nvfp4(
     fc1_recipe = recipe
     fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
     backend = (
-        {}
-        if fc1_recipe == fc2_recipe == "v1"
-        else {"kernel_preference": "triton"}
+        {} if kernel_preference is None else {"kernel_preference": kernel_preference}
     )
     config.model_spec = model_registry(
         "debugmodel",
@@ -320,6 +320,7 @@ def deepseek_v3_16b_nvfp4(
     bf16_tail_fraction: float = 0.0,
     recipe: str = "v1",
     fc2_recipe: str | None = None,
+    kernel_preference: str | None = None,
 ) -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
@@ -359,19 +360,16 @@ def deepseek_v3_16b_nvfp4(
     # 10944 % 128 == 64, so it cannot be NVFP4.
     n_layers = len(config.model_spec.model.layers)
     fqns = nvfp4_bf16_tail_fqns(n_layers, bf16_tail_fraction)
-    # V1_REQUANT has no CuteDSL grouped kernels, and both converters raise rather
-    # than downgrade, so the backend follows the recipe -- it is not a second knob.
-    # Deliberately left UNSET for "v1": deepseek_v3_16b_nvfp4_triton flips the
-    # backend by patching the Config class default, and an explicit kwarg at the
-    # call site would win over that patch.
+    # kernel_preference is deliberately left UNSET unless asked for, so the
+    # converter default applies: deepseek_v3_16b_nvfp4_triton flips the backend
+    # by patching the Config class default, and an explicit kwarg at the call
+    # site would win over that patch.
     # recipe names FC1 (w1 gate, w3 up); fc2_recipe names FC2 (w2 down) and
     # defaults to the same, so an unsplit config is unchanged by the split option.
     fc1_recipe = recipe
     fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
     backend = (
-        {}
-        if fc1_recipe == fc2_recipe == "v1"
-        else {"kernel_preference": "triton"}
+        {} if kernel_preference is None else {"kernel_preference": kernel_preference}
     )
     config.model_spec = model_registry(
         "16B",
@@ -542,7 +540,9 @@ def deepseek_v3_671b_12_layers_nvfp4_mixed() -> Trainer.Config:
 
 
 def deepseek_v3_671b_nvfp4_mixed(
-    recipe: str = "v1", fc2_recipe: str | None = None
+    recipe: str = "v1",
+    fc2_recipe: str | None = None,
+    kernel_preference: str | None = None,
 ) -> Trainer.Config:
     config = deepseek_v3_671b()
     assert config.model_spec is not None
@@ -566,19 +566,16 @@ def deepseek_v3_671b_nvfp4_mixed(
     # a 340-step horizon -- but F0L0 + mxfp8 projections is a new cell.
     n_layers = len(config.model_spec.model.layers)
     fqns = nvfp4_bf16_tail_fqns(n_layers, 0.0)
-    # V1_REQUANT has no CuteDSL grouped kernels, and both converters raise rather
-    # than downgrade, so the backend follows the recipe -- it is not a second knob.
-    # Deliberately left UNSET for "v1", matching deepseek_v3_16b_nvfp4: an explicit
-    # kwarg here would win over the Config-default patching that
-    # deepseek_v3_16b_nvfp4_triton relies on, and the two functions stay symmetric.
+    # kernel_preference is deliberately left UNSET unless asked for, matching
+    # deepseek_v3_16b_nvfp4: an explicit kwarg here would win over the
+    # Config-default patching that deepseek_v3_16b_nvfp4_triton relies on, and
+    # the two functions stay symmetric.
     # recipe names FC1 (w1 gate, w3 up); fc2_recipe names FC2 (w2 down) and
     # defaults to the same, so an unsplit config is unchanged by the split option.
     fc1_recipe = recipe
     fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
     backend = (
-        {}
-        if fc1_recipe == fc2_recipe == "v1"
-        else {"kernel_preference": "triton"}
+        {} if kernel_preference is None else {"kernel_preference": kernel_preference}
     )
     config.model_spec = model_registry(
         "671B",
