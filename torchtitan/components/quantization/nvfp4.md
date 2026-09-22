@@ -172,6 +172,8 @@ property of DSV3's dimensions rather than of the recipe. Attention stays MXFP8,
 - `kernel_preference` selects the backend for every recipe. A V2 step is bitwise
   identical on `triton` and `cutedsl`; the V1_REQUANT backward is not, because its
   stochastic-rounding cast of `dy` draws a different Philox stream per backend.
+  `ms_eden_fast_path=True` (CuteDSL only, V2 only) rounds the MS-EDEN scales in
+  hardware: the FP4 codes stay bitwise, the scale bytes do not.
 - Plain `torch.compile` works. CUDA graphs (`mode="reduce-overhead"`) do not: the
   grouped path allocates its offsets tensor inside the traced region.
 - Under pipeline parallelism the schedule drives its own microbatches internally,
