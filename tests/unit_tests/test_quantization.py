@@ -593,23 +593,22 @@ def test_nvfp4_grouped_experts_reject_an_unknown_recipe(field_name):
         config.build()
 
 
-def test_nvfp4_non_v1_recipes_reject_cutedsl():
-    """V1_REQUANT and V2 are Triton-only; the CuteDSL grouped kernels exist for V1
-    alone. Raise rather than silently downgrading the backend, which would leave the
-    run slower than requested with no indication why."""
+def test_nvfp4_non_v1_recipes_take_cutedsl():
+    """The backend is a knob on every recipe: torchao routes V1_REQUANT and V2
+    through kernel_preference too, so the module must carry the requested
+    backend rather than pin the non-v1 recipes to Triton."""
     pytest.importorskip("torchao")
     nvfp4_mod = _nvfp4_experts_or_skip()
     cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
-    config = cls.Config(
+    module = cls.Config(
         dim=256,
         hidden_dim=512,
         num_experts=2,
         kernel_preference="cutedsl",
         fc1_recipe="v1_requant",
         fc2_recipe="v2",
-    )
-    with pytest.raises(ValueError, match="only available for recipe 'v1'"):
-        config.build()
+    ).build()
+    assert module._kernel_preference is nvfp4_mod.KernelPreference.CUTEDSL
 
 
 def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch):
@@ -623,13 +622,16 @@ def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch)
     nvfp4_mod = _nvfp4_experts_or_skip()
 
     calls = []
+    prefs = []
 
     def v1_requant_stub(A, B, **kwargs):
         calls.append(("v1_requant", tuple(B.shape)))
+        prefs.append(kwargs["kernel_preference"])
         return torch.zeros(A.shape[0], B.shape[1])
 
     def v2_stub(A, B, **kwargs):
         calls.append(("v2", tuple(B.shape)))
+        prefs.append(kwargs["kernel_preference"])
         return torch.zeros(A.shape[0], B.shape[1])
 
     import torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm_v2 as v2_mod
@@ -659,6 +661,8 @@ def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch)
     # B_t -- so w1/w3 arrive as (E, hidden, dim) and w2 as (E, dim, hidden).
     assert calls[0][1] == (2, 256, 128) and calls[1][1] == (2, 256, 128)
     assert calls[2][1] == (2, 128, 256)
+    # The module's backend reaches every entry point, not only the V1 seam.
+    assert prefs == [nvfp4_mod.KernelPreference.TRITON] * 3
 
 
 def test_nvfp4_fc1_and_fc2_state_is_independent():
@@ -770,6 +774,57 @@ def test_nvfp4_grouped_converter_passes_recipes_through(monkeypatch):
     assert routed.inner_experts.fc2_recipe == "v2"
 
 
+def test_nvfp4_grouped_converter_takes_ms_eden_fast_path_when_a_half_runs_v2(
+    monkeypatch,
+):
+    """Design doc §17's split runs V2 on FC2 alone, and that is enough to accept the
+    flag: it reaches nvfp4_v2_grouped_mm, and only that entry point, since MS-EDEN
+    is the V2 gradient rounding and nothing else reads it."""
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
+
+    converter_config = nvfp4_mod.NVFP4GroupedExpertsConverter.Config(
+        model_compile_enabled=True,
+        kernel_preference="cutedsl",
+        fc1_recipe="v1_requant",
+        fc2_recipe="v2",
+        ms_eden_fast_path=True,
+    )
+    routed = RoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(dim=128, hidden_dim=256, num_experts=2),
+        token_dispatcher=AllToAllTokenDispatcher.Config(num_experts=2, top_k=1),
+    )
+    nvfp4_mod.NVFP4GroupedExpertsConverter(converter_config).convert(routed)
+    assert routed.inner_experts.ms_eden_fast_path is True
+
+    seen = []
+
+    def v1_requant_stub(A, B, **kwargs):
+        seen.append(("v1_requant", "ms_eden_fast_path" in kwargs))
+        return torch.zeros(A.shape[0], B.shape[1])
+
+    def v2_stub(A, B, **kwargs):
+        seen.append(("v2", kwargs["ms_eden_fast_path"]))
+        return torch.zeros(A.shape[0], B.shape[1])
+
+    import torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm_v2 as v2_mod
+
+    monkeypatch.setattr(v2_mod, "nvfp4_v1_requant_grouped_mm", v1_requant_stub)
+    monkeypatch.setattr(v2_mod, "nvfp4_v2_grouped_mm", v2_stub)
+    module = routed.inner_experts.build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+    module(torch.zeros(256, 128), torch.tensor([128, 128], dtype=torch.int32))
+    assert seen == [("v1_requant", False), ("v1_requant", False), ("v2", True)]
+
+    # Neither half on V2: nothing would read the flag, so refuse at converter build
+    # rather than run the default path under a label that says otherwise.
+    with pytest.raises(ValueError, match="ms_eden_fast_path=True requires"):
+        nvfp4_mod.NVFP4GroupedExpertsConverter(
+            dataclasses.replace(converter_config, fc2_recipe="v1_requant")
+        )
+
+
 def test_nvfp4_linear_v2_materializes_both_sign_vectors():
     """V2 needs an RHT-128 wgrad vector and a second one for dgrad.
 
@@ -817,17 +872,72 @@ def test_nvfp4_linear_v1_recipes_have_no_dgrad_vector():
         assert getattr(module, "_dgrad_rht_sign_vector", None) is None
 
 
-def test_nvfp4_linear_v2_rejects_cutedsl():
-    """V2 is Triton-only. Downgrading silently would leave a run slower than asked
-    for, on a different SR stream, with nothing in the log to say so."""
+def test_nvfp4_linear_v2_takes_cutedsl():
+    """The backend is a knob on every recipe; torchao's V2 linear reads
+    kernel_preference from the module, so the choice must land there."""
     NVFP4Linear = _nvfp4_linear_cls()
-    with pytest.raises(ValueError, match="only available for recipe 'v1'"):
-        NVFP4Linear.Config(
-            in_features=512,
-            out_features=512,
-            recipe="v2",
-            kernel_preference="cutedsl",
-        ).build()
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    module = NVFP4Linear.Config(
+        in_features=512,
+        out_features=512,
+        recipe="v2",
+        kernel_preference="cutedsl",
+    ).build()
+    assert module.kernel_preference is KernelPreference.CUTEDSL
+
+
+def test_nvfp4_linear_ms_eden_fast_path_reaches_the_v2_entry_point(monkeypatch):
+    """Only nvfp4_linear_v2 takes the fast path and the TorchAO base has no slot for
+    it, so the module carries the flag itself and passes it on that call alone."""
+    NVFP4Linear = _nvfp4_linear_cls()
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    seen = []
+
+    def v2_stub(x, weight, bias, **kwargs):
+        seen.append(kwargs["ms_eden_fast_path"])
+        return torch.zeros(x.shape[0], weight.shape[0])
+
+    monkeypatch.setattr(nvfp4_mod, "nvfp4_linear_v2", v2_stub)
+
+    module = NVFP4Linear.Config(
+        in_features=512,
+        out_features=512,
+        recipe="v2",
+        kernel_preference="cutedsl",
+        ms_eden_fast_path=True,
+    ).build()
+    assert module.ms_eden_fast_path is True
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+    module(torch.zeros(128, 512))
+    assert seen == [True]
+
+    # Off by default, so an unchanged config stays bitwise with Triton.
+    module = NVFP4Linear.Config(in_features=512, out_features=512).build()
+    assert module.ms_eden_fast_path is False
+
+
+@pytest.mark.parametrize(
+    "kernel_preference, recipe", [("triton", "v2"), ("cutedsl", "v1")]
+)
+def test_nvfp4_linear_converter_refuses_ms_eden_fast_path_off_cutedsl_v2(
+    monkeypatch, kernel_preference, recipe
+):
+    """The fast path is a CuteDSL variant of the V2 gradient quantize. On any other
+    backend or recipe nothing reads it, and the run would measure the default path
+    under a config that says otherwise -- so refuse at converter build."""
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
+    with pytest.raises(ValueError, match="ms_eden_fast_path=True requires"):
+        nvfp4_mod.NVFP4LinearConverter(
+            nvfp4_mod.NVFP4LinearConverter.Config(
+                model_compile_enabled=True,
+                kernel_preference=kernel_preference,
+                recipe=recipe,
+                ms_eden_fast_path=True,
+            )
+        )
 
 
 def test_nvfp4_linear_v2_signs_resample_in_place():

@@ -122,7 +122,11 @@ try:
         return pref
 
     def _log_kernel_preference(
-        what: str, pref: KernelPreference, use_fast_math: bool, per_op: bool
+        what: str,
+        pref: KernelPreference,
+        use_fast_math: bool,
+        ms_eden_fast_path: bool,
+        per_op: bool,
     ) -> None:
         """Record the quantization backend this recipe pins, and refuse to fall back.
 
@@ -139,7 +143,11 @@ try:
                 f"unavailable ({cutedsl_nvfp4_unavailable_reason()})."
             )
         logger.info(
-            "%s kernel_preference=%s, use_fast_math=%s", what, pref.value, use_fast_math
+            "%s kernel_preference=%s, use_fast_math=%s, ms_eden_fast_path=%s",
+            what,
+            pref.value,
+            use_fast_math,
+            ms_eden_fast_path,
         )
         if pref is KernelPreference.AUTO:
             # Only AUTO leaves the backend undetermined by the recipe. No single
@@ -194,6 +202,13 @@ try:
             them through ``build_nvfp4_sign_resampler``. Without that the run is
             still correct, but every step reuses the initial draw and the variance
             reduction V2 exists for is forfeited.
+            """
+
+            ms_eden_fast_path: bool = False
+            """Hardware stochastic rounding of the MS-EDEN scales in the V2 backward.
+
+            CuteDSL only. The FP4 codes stay bitwise with the default path; the
+            scale bytes do not stay bitwise with Triton.
             """
 
             def __post_init__(self) -> None:
@@ -276,17 +291,9 @@ try:
                 use_fast_math=config.use_fast_math,
                 recipe=NVFP4Recipe(config.recipe),
             )
-            # V1_REQUANT and V2 are Triton-only; the CuteDSL kernels exist for V1
-            # alone. Raise rather than silently downgrade, matching the grouped
-            # converter.
-            if (
-                config.recipe != "v1"
-                and self.kernel_preference is KernelPreference.CUTEDSL
-            ):
-                raise ValueError(
-                    "kernel_preference='cutedsl' is only available for recipe 'v1'; "
-                    f"got recipe={config.recipe!r}. Use 'triton'."
-                )
+            # The fast path has no slot on the TorchAO base: only the two V2 entry
+            # points take it, so the module carries it for its own forward.
+            self.ms_eden_fast_path = config.ms_eden_fast_path
             # TorchAO created the runtime buffers on the (meta) build device.
             # Re-register them as None so ``_distribute_states`` skips them and
             # ``_init_self_buffers`` materializes them on the real device, per
@@ -392,7 +399,9 @@ try:
                     wgrad_rht=self._rht_sign_vector,
                     dgrad_rht=self._dgrad_rht_sign_vector,
                     sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
                     use_fast_math=self.use_fast_math,
+                    ms_eden_fast_path=self.ms_eden_fast_path,
                 )
             if self.recipe is not NVFP4Recipe.V1:
                 return nvfp4_linear_v1_requant(
@@ -401,6 +410,7 @@ try:
                     self.bias,
                     sign_vector=self.rht_sign_vector,
                     sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
                     use_fast_math=self.use_fast_math,
                 )
             return nvfp4_linear(
@@ -479,6 +489,17 @@ class NVFP4LinearConverter(QuantizationConverter):
         than V2, which is why the resampler logs its buffer count at startup.
         """
 
+        ms_eden_fast_path: bool = False
+        """Hardware stochastic rounding of the MS-EDEN scales in the V2 backward.
+
+        Off by default, which is bitwise with Triton. On, the CuteDSL MS-EDEN kernel
+        rounds each E4M3 scale in hardware: the FP4 codes stay bitwise with the
+        default path, but a scale byte may land on the other of its two E4M3
+        neighbours, so the step is no longer bitwise with Triton. CuteDSL only --
+        the Triton op has no fast path -- and V2 only, because MS-EDEN is the V2
+        gradient rounding; the converter refuses any other combination.
+        """
+
     def __init__(self, config: Config):
         self.config = config
 
@@ -498,10 +519,19 @@ class NVFP4LinearConverter(QuantizationConverter):
                 "of NVFP4 dynamic quantization."
             )
 
+        if self.config.ms_eden_fast_path and (
+            self.config.kernel_preference != "cutedsl" or self.config.recipe != "v2"
+        ):
+            raise ValueError(
+                "NVFP4Linear ms_eden_fast_path=True requires kernel_preference="
+                "'cutedsl' and recipe='v2'; got kernel_preference="
+                f"{self.config.kernel_preference!r}, recipe={self.config.recipe!r}."
+            )
         _log_kernel_preference(
             f"NVFP4Linear recipe={self.config.recipe}",
             _to_kernel_preference(self.config.kernel_preference),
             self.config.use_fast_math,
+            self.config.ms_eden_fast_path,
             per_op=False,
         )
 
@@ -518,6 +548,7 @@ class NVFP4LinearConverter(QuantizationConverter):
                     kernel_preference=self.config.kernel_preference,
                     use_fast_math=self.config.use_fast_math,
                     recipe=self.config.recipe,
+                    ms_eden_fast_path=self.config.ms_eden_fast_path,
                 )
                 if parent is None:
                     model_config = new_config
@@ -687,10 +718,14 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             fc2_recipe: str = "v1"
             """NVFP4 recipe for the FC2 down GEMM (``w2``)."""
 
+            ms_eden_fast_path: bool = False
+            """Hardware stochastic rounding of the MS-EDEN scales in the V2 backward."""
+
         def __init__(self, config: Config):
             super().__init__(config)
             self._kernel_preference = _to_kernel_preference(config.kernel_preference)
             self._use_fast_math = config.use_fast_math
+            self._ms_eden_fast_path = config.ms_eden_fast_path
             for name in ("fc1_recipe", "fc2_recipe"):
                 value = getattr(config, name)
                 if value not in _NVFP4_RECIPES:
@@ -699,16 +734,6 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                     )
             self._fc1_recipe = config.fc1_recipe
             self._fc2_recipe = config.fc2_recipe
-            # V1_REQUANT and V2 are Triton-only for now; the CuteDSL grouped kernels
-            # exist for V1 alone. Raise rather than silently downgrade the backend.
-            if (
-                self._fc1_recipe != "v1" or self._fc2_recipe != "v1"
-            ) and self._kernel_preference is KernelPreference.CUTEDSL:
-                raise ValueError(
-                    "kernel_preference='cutedsl' is only available for recipe 'v1'; "
-                    f"got fc1_recipe={self._fc1_recipe!r}, "
-                    f"fc2_recipe={self._fc2_recipe!r}. Use 'triton'."
-                )
             # Same buffer protocol as NVFP4Linear.__init__: register the runtime
             # buffers as None so _distribute_states skips them and
             # _init_self_buffers materializes them per rank on the real device.
@@ -850,6 +875,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                     sr_seed=seed,
                     offs=offs,
                     pad_token_groups_for_grouped_mm=False,
+                    kernel_preference=self._kernel_preference,
                     use_fast_math=self._use_fast_math,
                 )
             return nvfp4_v2_grouped_mm(
@@ -860,7 +886,9 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 sr_seed=seed,
                 offs=offs,
                 pad_token_groups_for_grouped_mm=False,
+                kernel_preference=self._kernel_preference,
                 use_fast_math=self._use_fast_math,
+                ms_eden_fast_path=self._ms_eden_fast_path,
             )
 
         def forward(self, x_RD, num_tokens_per_expert_E):
@@ -952,11 +980,18 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
 
         Defaults to "v1" so an unchanged config is unaffected by this option's
         existence. Design doc §17 recommends "v1_requant" here and "v2" for FC2.
-        Both non-v1 recipes require kernel_preference="triton".
         """
 
         fc2_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
         """NVFP4 recipe for the FC2 down GEMM (``w2``). See ``fc1_recipe``."""
+
+        ms_eden_fast_path: bool = False
+        """Hardware stochastic rounding of the MS-EDEN scales in the V2 backward.
+
+        Applies to whichever of FC1 / FC2 runs "v2"; see
+        ``NVFP4LinearConverter.Config.ms_eden_fast_path`` for what it changes.
+        CuteDSL only, and at least one of the two halves must run "v2".
+        """
 
     def __init__(self, config: Config):
         self.config = config
@@ -981,11 +1016,23 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             )
 
         self._kernel_preference = _to_kernel_preference(self.config.kernel_preference)
+        if self.config.ms_eden_fast_path and (
+            self.config.kernel_preference != "cutedsl"
+            or "v2" not in (self.config.fc1_recipe, self.config.fc2_recipe)
+        ):
+            raise ValueError(
+                "NVFP4GroupedExperts ms_eden_fast_path=True requires "
+                "kernel_preference='cutedsl' and 'v2' on fc1_recipe or fc2_recipe; "
+                f"got kernel_preference={self.config.kernel_preference!r}, "
+                f"fc1_recipe={self.config.fc1_recipe!r}, "
+                f"fc2_recipe={self.config.fc2_recipe!r}."
+            )
         _log_kernel_preference(
             f"NVFP4GroupedExperts fc1={self.config.fc1_recipe} "
             f"fc2={self.config.fc2_recipe}",
             self._kernel_preference,
             self.config.use_fast_math,
+            self.config.ms_eden_fast_path,
             per_op=True,
         )
 
@@ -1010,6 +1057,7 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             new_config.use_fast_math = self.config.use_fast_math
             new_config.fc1_recipe = self.config.fc1_recipe
             new_config.fc2_recipe = self.config.fc2_recipe
+            new_config.ms_eden_fast_path = self.config.ms_eden_fast_path
             if parent is None:
                 model_config = new_config
             elif isinstance(parent, list):
